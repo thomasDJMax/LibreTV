@@ -73,7 +73,7 @@ body {
 
 /* 暗色主题：模拟旧版 .page-bg 的深蓝黑纵向渐变 */
 .dark body {
-  background: linear-gradient(180deg, rgb(11 16 26), rgb(20 28 41)) fixed;
+  background: linear-gradient(180deg, rgb(11 16 26), rgb(20 28 41));
 }
 
 body {
@@ -83,7 +83,8 @@ body {
 
 @layer components {
   .card {
-    @apply bg-card border border-line rounded-lg overflow-hidden transition-all duration-200;
+    @apply bg-card border border-line rounded-lg overflow-hidden duration-150 ease-out;
+    transition-property: transform, background-color, border-color;
   }
   .btn {
     @apply inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
@@ -153,4 +154,19 @@ body {
 @keyframes live-breathe {
   0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
   50% { opacity: 0.55; box-shadow: 0 0 0 4px rgba(239, 68, 68, 0); }
+}
+
+/* 只收敛本站装饰动效，不干预播放器及抽屉的挂载/卸载生命周期。 */
+@media (prefers-reduced-motion: reduce) {
+  .card,
+  .btn,
+  .chip {
+    transition-duration: 0.01ms;
+  }
+
+  .animate-fade-in,
+  .animate-slide-up,
+  .live-dot {
+    animation: none;
+  }
 }

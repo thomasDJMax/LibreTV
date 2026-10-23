@@ -7,6 +7,7 @@ import { useAppStore } from '@/lib/store';
 import { cn } from '@/lib/utils';
 import type { DoubanItem } from '@/lib/types';
 import { DoubanCard } from './video-card';
+import { RankingSection } from './ranking-section';
 
 const MOVIE_TAGS = ['热门', '最新', '经典', '豆瓣高分', '冷门佳片', '华语', '欧美', '韩国', '日本', '动画'];
 const TV_TAGS = ['热门', '美剧', '英剧', '韩剧', '日剧', '国产剧', '港剧', '日本动画', '综艺', '纪录片'];
@@ -19,7 +20,7 @@ export function RecommendSection({ onPick }: { onPick: (title: string) => void }
 
   if (!doubanEnabled) return null;
   if (recommendSource === 'bangumi') return <BangumiView onPick={onPick} />;
-  if (recommendSource === 'hot-list') return <HotListView onPick={onPick} />;
+  if (recommendSource === 'hot-list') return <RankingSection onPick={onPick} />;
   return <DoubanView onPick={onPick} />;
 }
 
@@ -118,51 +119,6 @@ function BangumiView({ onPick }: { onPick: (title: string) => void }) {
         {WEEKDAYS.map((name, i) => (
           <ChipButton key={name} active={weekday === i + 1} onClick={() => setWeekday(i + 1)}>
             {name}
-          </ChipButton>
-        ))}
-      </div>
-
-      {query.isError ? (
-        <p className="text-center text-sm text-faint py-8">推荐内容加载失败，可稍后重试或在设置中关闭</p>
-      ) : query.isLoading ? (
-        <GridSkeleton />
-      ) : (
-        <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 gap-2.5">
-          {items.map((item) => (
-            <DoubanCard key={item.id} item={item} onClick={() => onPick(item.title)} />
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-const HOT_LISTS = [
-  { id: 'douban_movie_weekly', label: '电影周榜' },
-  { id: 'douban_tv_chinese', label: '国产剧周榜' },
-  { id: 'douban_tv_global', label: '海外剧周榜' },
-  { id: 'douban_show_chinese', label: '国内综艺' },
-  { id: 'douban_show_global', label: '海外综艺' },
-  { id: 'baidu_teleplay', label: '百度热播剧' },
-];
-
-/** 影视热榜（60s API）：豆瓣五个周榜 + 百度热播剧，chips 切换 */
-function HotListView({ onPick }: { onPick: (title: string) => void }) {
-  const [listId, setListId] = useState(HOT_LISTS[0].id);
-
-  const query = useQuery({
-    queryKey: ['hot-list', listId],
-    queryFn: ({ signal }) => api.hotList(listId, signal),
-  });
-
-  const items = query.data?.items ?? [];
-
-  return (
-    <section aria-label="影视榜单推荐">
-      <div className="flex flex-wrap gap-1.5 mb-4">
-        {HOT_LISTS.map((l) => (
-          <ChipButton key={l.id} active={listId === l.id} onClick={() => setListId(l.id)}>
-            {l.label}
           </ChipButton>
         ))}
       </div>

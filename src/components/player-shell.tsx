@@ -12,6 +12,26 @@ import {
 } from '@/lib/video-prefetcher';
 import { loadCacheSettings } from '@/lib/video-cache';
 import { formatTime } from '@/lib/utils';
+import {
+  buildPlayerQualityOptions,
+  createFragmentRateSample,
+  formatDownloadSpeed,
+  formatMediaBitrate,
+  formatVideoDimensions,
+  recentMediaBitrate,
+  DEFAULT_INTRO_SKIP,
+  DEFAULT_OUTRO_SKIP,
+  normalizeIntroSkipPreferences,
+  normalizeOutroSkipPreferences,
+  resolveStartPosition,
+  shouldAutoSkipOutro,
+  shouldResumeFinishedEpisode,
+  type EpisodeCompletion,
+  type FragmentRateSample,
+  type IntroSkipPreferences,
+  type OutroSkipPreferences,
+  type PlayerQualityOption,
+} from '@/lib/player-quality';
 
 /**
  * 播放器外壳：ArtPlayer + hls.js（旧版 player.js 的 React 化）。
@@ -36,11 +56,36 @@ interface PlayerShellProps {
   /** 进度恢复：优先 URL position，其次查询该回调（返回 0 表示无记录） */
   getRestorePosition?: () => number | Promise<number>;
   onTimeUpdate?: (position: number, duration: number) => void;
-  onEnded?: () => void;
+  onEnded?: (reason?: 'ended' | 'outro') => void;
   onPause?: (position: number, duration: number) => void;
   /** 恢复策略判源不可用（重试耗尽/格式硬失败）时回调：父级弹出换源面板 */
   onRequestSwitchSource?: (reason: string) => void;
 }
+
+interface QualityControlsState {
+  session: number;
+  ready: boolean;
+  options: PlayerQualityOption[];
+  selected: number;
+  active: number;
+}
+
+interface QualityRatesState {
+  media: string | null;
+  download: string | null;
+  cached: boolean;
+}
+
+interface EpisodeStartState {
+  preferences: IntroSkipPreferences;
+  saved: number;
+  ready: boolean;
+  lookup?: Promise<number>;
+}
+
+const INTRO_SKIP_KEY = 'libretv:intro-skip:v1';
+const OUTRO_SKIP_KEY = 'libretv:outro-skip:v1';
+const INTRO_SKIP_PRESETS = [30, 60, 90, 120];
 
 export function PlayerShell({
   url,
@@ -62,6 +107,27 @@ export function PlayerShell({
   const hlsRef = useRef<Hls | null>(null);
   const [error, setError] = useState('');
   const [hint, setHint] = useState('');
+  const [actualDimensions, setActualDimensions] = useState<string | null>(null);
+  const [quality, setQuality] = useState<QualityControlsState>({
+    session: 0, ready: false, options: [], selected: -1, active: -1,
+  });
+  const [qualityRates, setQualityRates] = useState<QualityRatesState>({
+    media: null, download: null, cached: false,
+  });
+  const [introPreferences, setIntroPreferences] = useState(DEFAULT_INTRO_SKIP);
+  const [customIntroSeconds, setCustomIntroSeconds] = useState(false);
+  const introPreferencesRef = useRef(DEFAULT_INTRO_SKIP);
+  const [outroPreferences, setOutroPreferences] = useState(DEFAULT_OUTRO_SKIP);
+  const [customOutroSeconds, setCustomOutroSeconds] = useState(false);
+  const outroPreferencesRef = useRef(DEFAULT_OUTRO_SKIP);
+  // Snapshot preferences per episode: changing the controls never seeks the current video.
+  const episodeStartRef = useRef<EpisodeStartState>({
+    preferences: DEFAULT_INTRO_SKIP, saved: 0, ready: false,
+  });
+  // Instance identity prevents an old manifest, deferred callback or select event from
+  // applying a previous episode's level indexes after fallback or a source switch.
+  const qualitySessionRef = useRef(0);
+  const fragmentSamplesRef = useRef<Array<FragmentRateSample & { key: string }>>([]);
   // 起播前的品牌占位图（沿用旧版 nomedia 素材），实际开始播放后隐藏
   const [showPoster, setShowPoster] = useState(true);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -91,13 +157,76 @@ export function PlayerShell({
   const currentMediaUrlRef = useRef(url);
   // 本集的恢复策略实例：跨直连/代理两级重建共享计数
   const recoveryRef = useRef<PlaybackRecovery | null>(null);
-  // 自然播完标记，卸载时不回写进度（避免覆盖「已看完」记录）
-  const endedRef = useRef(false);
+  // 自然播完或跳片尾后的完成标记，所有进度回写与完成事件都必须检查它。
+  const endedRef = useRef<EpisodeCompletion>(false);
 
   const showHint = (text: string) => {
     setHint(text);
     if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
     hintTimerRef.current = setTimeout(() => setHint(''), 2500);
+  };
+
+  const updateIntroPreferences = (patch: Partial<IntroSkipPreferences>) => {
+    const next = normalizeIntroSkipPreferences({ ...introPreferencesRef.current, ...patch });
+    introPreferencesRef.current = next;
+    setIntroPreferences(next);
+    try { localStorage.setItem(INTRO_SKIP_KEY, JSON.stringify(next)); } catch { /* Storage may be unavailable. */ }
+  };
+
+  const updateOutroPreferences = (patch: Partial<OutroSkipPreferences>) => {
+    const next = normalizeOutroSkipPreferences({ ...outroPreferencesRef.current, ...patch });
+    outroPreferencesRef.current = next;
+    setOutroPreferences(next);
+    try { localStorage.setItem(OUTRO_SKIP_KEY, JSON.stringify(next)); } catch { /* Storage may be unavailable. */ }
+  };
+
+  const finishEpisode = (reason: 'ended' | 'outro') => {
+    if (endedRef.current) return;
+    // Set this before pause: pause/timeupdate/visibility events must not overwrite
+    // the completion record or accidentally invoke the callback a second time.
+    const p = propsRef.current;
+    endedRef.current = reason === 'outro' || (p.autoplayNext && !!p.nextUrl) ? 'advancing' : 'ended';
+    getVideoPrefetcher().stop();
+    if (reason === 'outro') {
+      artRef.current?.pause();
+      hlsRef.current?.stopLoad();
+    }
+    propsRef.current.onEnded?.(reason);
+  };
+
+  const applyInitialPosition = (video: HTMLVideoElement) => {
+    const start = episodeStartRef.current;
+    if (restoredRef.current || !start.ready || video.readyState < HTMLMediaElement.HAVE_METADATA) return;
+    const planned = resolveStartPosition({ duration: video.duration, savedPosition: start.saved, preferences: start.preferences });
+    if (planned === null) return;
+    // A user may already have sought while the asynchronous history lookup completed.
+    const current = Number.isFinite(video.currentTime) && video.currentTime < video.duration - 2 ? video.currentTime : 0;
+    const target = Math.max(planned, current);
+    restoredRef.current = true;
+    try {
+      if (target > video.currentTime + 0.5) video.currentTime = target;
+    } catch {
+      restoredRef.current = false;
+      return;
+    }
+    if (planned > 0) showHint(`已从 ${formatTime(target)} 开始播放`);
+    ensurePrefetch(currentMediaUrlRef.current, target);
+  };
+
+  const skipIntroNow = () => {
+    const video = artRef.current?.video as HTMLVideoElement | undefined;
+    if (!video) return;
+    const target = resolveStartPosition({
+      duration: video.duration,
+      preferences: { ...introPreferencesRef.current, enabled: true },
+    });
+    if (target === null) { showHint('正在读取视频时长，请稍后重试'); return; }
+    if (target <= 0) { showHint('设定时长为零或视频较短，已保留片尾'); return; }
+    if (video.currentTime >= target) { showHint('已超过设定的片头位置'); return; }
+    try { video.currentTime = target; } catch { showHint('视频尚未准备好，请稍后重试'); return; }
+    restoredRef.current = true;
+    ensurePrefetch(currentMediaUrlRef.current, target);
+    showHint(`已跳至 ${formatTime(target)}`);
   };
 
   // 片段缓存开启时调大 hls.js 自身缓冲，缓冲之外的空窗由预取器补齐
@@ -107,6 +236,9 @@ export function PlayerShell({
     const cacheEnabled = cacheSettings.enabled && !!p.episodeKey;
     return {
       debug: false,
+      // Wait for the resume lookup before requesting video fragments. Direct media
+      // playlists can start near the intro target without downloading the opening.
+      autoStartLoad: false,
       enableWorker: true,
       backBufferLength: 90,
       maxBufferLength: cacheEnabled ? 120 : 30,
@@ -154,45 +286,118 @@ export function PlayerShell({
    * 注意：不销毁 ArtPlayer，只销毁并重建 hls，从而保留网页全屏等播放器状态。
    */
   const setupHls = (video: HTMLVideoElement, mediaUrl: string, allowProxyFallback: boolean) => {
+    const retryPosition = restoredRef.current && Number.isFinite(video.currentTime) ? video.currentTime : undefined;
+    const session = ++qualitySessionRef.current;
+    setActualDimensions(null);
+    setQuality({ session, ready: false, options: [], selected: -1, active: -1 });
+    fragmentSamplesRef.current = [];
+    setQualityRates((previous) => previous.media || previous.download || previous.cached
+      ? { media: null, download: null, cached: false } : previous);
     hlsRef.current?.destroy();
     currentMediaUrlRef.current = mediaUrl;
     const hls = new Hls(buildHlsConfig());
     hlsRef.current = hls;
+    const isCurrent = () => hlsRef.current === hls && qualitySessionRef.current === session;
+    const updateOptions = () => {
+      if (!isCurrent()) return;
+      const options = buildPlayerQualityOptions(hls.levels);
+      setQuality((previous) => {
+        if (previous.session !== session) return previous;
+        if (previous.ready && JSON.stringify(previous.options) === JSON.stringify(options)) return previous;
+        return { ...previous, ready: true, options };
+      });
+    };
 
     hls.loadSource(mediaUrl);
     hls.attachMedia(video);
 
     hls.on(Hls.Events.MANIFEST_PARSED, async () => {
+      if (!isCurrent()) return;
+      updateOptions();
       recoveryRef.current?.markHealthy();
-      // 预取锚点：恢复进度时直接取恢复目标。赋值后 video.currentTime 未必立刻反映
-      // （Safari 系），而 ensure 是以「锚点未变」为前提复用 parsing 中的运行的——
-      // 这里读到旧值会把窗口建在片头，且白等一次纠错重建。
-      let prefetchAnchor = video.currentTime;
-      // 进度恢复（每集一次）：优先 URL position，其次 IndexedDB 记录
-      if (!restoredRef.current) {
-        restoredRef.current = true;
-        try {
-          const saved = (await propsRef.current.getRestorePosition?.()) ?? 0;
-          const duration = artRef.current?.duration || 0;
-          if (saved > 10 && duration > 0 && saved < duration - 2) {
-            if (artRef.current) artRef.current.currentTime = saved;
-            prefetchAnchor = saved;
-            showHint(`已从 ${formatTime(saved)} 继续播放`);
-          }
-        } catch { /* 忽略恢复失败 */ }
+      const start = episodeStartRef.current;
+      if (!restoredRef.current && !start.ready) {
+        const getSaved = propsRef.current.getRestorePosition;
+        start.lookup ??= Promise.resolve().then(() => getSaved?.() ?? 0).catch(() => 0);
+        const saved = await start.lookup;
+        if (!isCurrent() || episodeStartRef.current !== start) return;
+        start.saved = saved;
+        start.ready = true;
       }
+      if (!isCurrent() || endedRef.current) return;
+      const details = hls.levels[hls.firstLevel]?.details;
+      const knownDuration = details && !details.live ? details.totalduration : NaN;
+      const prefetchAnchor = restoredRef.current
+        ? retryPosition ?? video.currentTime
+        : resolveStartPosition({ duration: knownDuration, savedPosition: start.saved, preferences: start.preferences }) ?? 0;
+      hls.startLoad(prefetchAnchor);
+      // A master playlist may not expose duration yet. Metadata/durationchange
+      // retries this once actual duration is available, never on every timeupdate.
+      applyInitialPosition(video);
       // 新集立即预取（否则要等 timeupdate 的 30s 节流，起播初期无缓存）
       ensurePrefetch(mediaUrl, prefetchAnchor);
       video.play().catch(() => {});
     });
+    hls.on(Hls.Events.LEVELS_UPDATED, () => {
+      if (!isCurrent()) return;
+      // Removing an unavailable variant can reindex every later level.
+      // Reset manual selection instead of silently choosing a different version.
+      if (!hls.autoLevelEnabled) hls.nextLevel = -1;
+      fragmentSamplesRef.current = [];
+      const active = hls.currentLevel;
+      setQuality((previous) => previous.session === session
+        ? { ...previous, selected: -1, active } : previous);
+      setQualityRates((previous) => previous.media || previous.download || previous.cached
+        ? { media: null, download: null, cached: false } : previous);
+      updateOptions();
+    });
+    hls.on(Hls.Events.LEVEL_SWITCHING, () => {
+      if (isCurrent()) fragmentSamplesRef.current = [];
+    });
+    hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
+      if (!isCurrent()) return;
+      setQuality((previous) => previous.session === session && previous.active !== data.level
+        ? { ...previous, active: data.level } : previous);
+    });
     // 播放链路恢复（FRAG_LOADED / MANIFEST_PARSED）：静默窗外清零连续失败计数
-    hls.on(Hls.Events.FRAG_LOADED, () => recoveryRef.current?.markHealthy());
+    hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+      if (!isCurrent()) return;
+      recoveryRef.current?.markHealthy();
+      // Init segments, separate audio tracks and subtitle payloads cannot provide
+      // a complete video-fragment rate. LL parts use their own media duration.
+      if (data.frag.type !== 'main' || typeof data.frag.sn !== 'number') return;
+      const stats = data.part?.stats ?? data.frag.stats;
+      const sample = createFragmentRateSample({
+        bytes: data.payload.byteLength,
+        duration: data.part?.duration ?? data.frag.duration,
+        // Our cache loader omits networkDetails and synthesizes loading timings.
+        fromNetwork: data.networkDetails != null,
+        loadingStart: stats.loading.start,
+        loadingEnd: stats.loading.end,
+      });
+      if (!sample) return;
+      const key = `${data.frag.level}:${data.frag.sn}:${data.part?.index ?? 'full'}`;
+      const samples = fragmentSamplesRef.current;
+      if (samples.some((item) => item.key === key)) return;
+      const recent = [...samples, { ...sample, key }].slice(-3);
+      fragmentSamplesRef.current = recent;
+      const bitrate = recentMediaBitrate(recent);
+      const rates = {
+        media: bitrate === null ? null : formatMediaBitrate(bitrate),
+        download: sample.downloadBytesPerSecond === null ? null : formatDownloadSpeed(sample.downloadBytesPerSecond),
+        cached: data.networkDetails == null,
+      };
+      setQualityRates((previous) => previous.media === rates.media
+        && previous.download === rates.download && previous.cached === rates.cached ? previous : rates);
+    });
     // 分片真正进入 MSE buffer 才算媒体恢复：此时视频轨可渲染，错误态可解除
     hls.on(Hls.Events.FRAG_BUFFERED, () => {
+      if (!isCurrent()) return;
       mediaHealthyRef.current = true;
     });
 
     hls.on(Hls.Events.ERROR, (_evt, data) => {
+      if (!isCurrent()) return;
       if (!data.fatal) return;
       const recovery = recoveryRef.current;
       if (!recovery) return;
@@ -238,13 +443,32 @@ export function PlayerShell({
     });
   };
 
+  const selectQuality = (value: string) => {
+    const hls = hlsRef.current;
+    if (!hls || !quality.ready || quality.session !== qualitySessionRef.current) return;
+    const index = value === 'auto' ? -1 : /^\d+$/.test(value) ? Number(value) : NaN;
+    if (index !== -1 && !quality.options.some((option) => option.levelIndex === index)) return;
+    if (!Number.isInteger(index) || index >= hls.levels.length) return;
+    // nextLevel switches without replacing the player or dropping the currently
+    // playing fragment, preserving progress and both fullscreen modes.
+    hls.nextLevel = index;
+    setQuality((previous) => previous.session === quality.session && previous.selected !== index
+      ? { ...previous, selected: index } : previous);
+    showHint(index === -1 ? '已恢复自动选择画质' : '已选择版本，后续片段将切换');
+  };
+
   /** 换集：重置每集状态并切换到新 HLS 源（不重建 ArtPlayer）。 */
-  const loadEpisode = (targetUrl: string) => {
+  const loadEpisode = (targetUrl: string, resetStart = true) => {
     if (!targetUrl) return;
+    if (!resetStart && endedRef.current) return;
     mediaHealthyRef.current = true;
     playbackStartedRef.current = false;
     videoErrorRetryUsedRef.current = false;
-    restoredRef.current = false;
+    if (resetStart) {
+      restoredRef.current = false;
+      episodeStartRef.current = { preferences: { ...introPreferencesRef.current }, saved: 0, ready: false };
+      endedRef.current = false;
+    }
     lastPrefetchEnsureRef.current = 0;
     recoveryRef.current = new PlaybackRecovery();
     // 换集时清掉上一集的预取窗口，避免带宽被旧集占用
@@ -260,6 +484,15 @@ export function PlayerShell({
   useEffect(() => {
     if (!containerRef.current || !propsRef.current.url) return;
     const initialUrl = propsRef.current.url;
+    let storedPreferences = DEFAULT_INTRO_SKIP;
+    try { storedPreferences = normalizeIntroSkipPreferences(JSON.parse(localStorage.getItem(INTRO_SKIP_KEY) ?? 'null')); } catch { /* Use defaults. */ }
+    introPreferencesRef.current = storedPreferences;
+    setIntroPreferences(storedPreferences);
+    episodeStartRef.current = { preferences: { ...storedPreferences }, saved: 0, ready: false };
+    let storedOutro = DEFAULT_OUTRO_SKIP;
+    try { storedOutro = normalizeOutroSkipPreferences(JSON.parse(localStorage.getItem(OUTRO_SKIP_KEY) ?? 'null')); } catch { /* Use defaults. */ }
+    outroPreferencesRef.current = storedOutro;
+    setOutroPreferences(storedOutro);
 
     // 初始化每集状态
     mediaHealthyRef.current = true;
@@ -301,6 +534,17 @@ export function PlayerShell({
       },
     });
     artRef.current = art;
+    const updateActualDimensions = () => {
+      // Manifest dimensions are only declarations. Use the decoded video element
+      // for this field, including resize events during an adaptive level switch.
+      const dimensions = formatVideoDimensions(art.video.videoWidth, art.video.videoHeight);
+      setActualDimensions((previous) => previous === dimensions ? previous : dimensions);
+    };
+    art.video.addEventListener('loadedmetadata', updateActualDimensions);
+    art.video.addEventListener('resize', updateActualDimensions);
+    const applyStart = () => applyInitialPosition(art.video);
+    art.video.addEventListener('loadedmetadata', applyStart);
+    art.video.addEventListener('durationchange', applyStart);
     art.on('video:loadedmetadata', () => {
       // ArtPlayer 运行时支持 title 选项（类型定义未覆盖），用于界面标题展示
       try {
@@ -310,6 +554,21 @@ export function PlayerShell({
     });
 
     art.on('video:playing', () => {
+      if (shouldResumeFinishedEpisode({
+        completion: endedRef.current,
+        currentTime: art.currentTime,
+        duration: art.duration,
+        paused: art.video.paused,
+        ended: art.video.ended,
+      })) {
+        // Replaying a completed movie/final episode starts a new progress session.
+        // Automatic next-episode navigation remains locked until loadEpisode.
+        endedRef.current = false;
+        lastSave = 0;
+        lastPrefetchEnsureRef.current = 0;
+      }
+      updateActualDimensions();
+      applyInitialPosition(art.video);
       playbackStartedRef.current = true;
       setShowPoster(false);
       // 仅在媒体真正恢复（有分片进入 buffer）后清错误遮罩：
@@ -329,6 +588,24 @@ export function PlayerShell({
       setError('视频播放失败，请尝试其他视频源');
     });
     art.on('video:timeupdate', () => {
+      if (endedRef.current) return;
+      const p = propsRef.current;
+      if (p.onEnded && shouldAutoSkipOutro({
+        duration: art.duration,
+        currentTime: art.currentTime,
+        introPreferences: episodeStartRef.current.preferences,
+        outroPreferences: outroPreferencesRef.current,
+        autoplayNext: p.autoplayNext,
+        hasNext: !!p.nextUrl,
+        isPlaying: playbackStartedRef.current && mediaHealthyRef.current
+          && art.video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA && !art.video.ended,
+        isPaused: art.video.paused,
+        isSeeking: art.video.seeking,
+        alreadyFinished: !!endedRef.current,
+      })) {
+        finishEpisode('outro');
+        return;
+      }
       const now = Date.now();
       if (now - lastSave > 5000) {
         lastSave = now;
@@ -343,9 +620,11 @@ export function PlayerShell({
       }
     });
     art.on('video:seeked', () => {
+      if (endedRef.current) return;
       ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
     });
     art.on('video:pause', () => {
+      if (endedRef.current || art.video.ended) return;
       propsRef.current.onPause?.(art.currentTime, art.duration);
       // 暂停 = 预取黄金窗口：解除限速并无限铺满整集（用户主动行为，带宽占用可接受）
       // waiting 触发的限速在此解除，否则黄金窗口会被 500ms 轮询冻结
@@ -360,15 +639,14 @@ export function PlayerShell({
       getVideoPrefetcher().setThrottled(false);
     });
     art.on('video:ended', () => {
-      endedRef.current = true;
-      propsRef.current.onEnded?.();
+      finishEpisode('ended');
     });
 
     // —— 键盘快捷键（旧版 hotkey:false + 自定义逻辑的移植） ——
     const shortcuts = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       // 输入框或按钮获得焦点时不劫持按键：否则空格会吞掉按钮的默认激活
-      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.closest('button')) return;
+      if (['INPUT', 'TEXTAREA', 'SELECT', 'OPTION'].includes(target.tagName) || target.closest('button')) return;
       const current = artRef.current;
       if (!current) return;
       if (e.altKey && e.key === 'ArrowLeft') { e.preventDefault(); return; } // 由父层处理集数切换
@@ -439,7 +717,7 @@ export function PlayerShell({
 
     // 卸载与页面隐藏时保存进度
     const saveOnHide = () => {
-      if (document.visibilityState === 'hidden') {
+      if (document.visibilityState === 'hidden' && !endedRef.current) {
         propsRef.current.onPause?.(art.currentTime, art.duration);
       }
     };
@@ -461,6 +739,11 @@ export function PlayerShell({
       el?.removeEventListener('touchcancel', onTouchEnd);
       el?.removeEventListener('touchmove', onTouchMove);
       el?.removeEventListener('contextmenu', onContextMenu);
+      art.video.removeEventListener('loadedmetadata', updateActualDimensions);
+      art.video.removeEventListener('resize', updateActualDimensions);
+      art.video.removeEventListener('loadedmetadata', applyStart);
+      art.video.removeEventListener('durationchange', applyStart);
+      fragmentSamplesRef.current = [];
       hlsRef.current?.destroy();
       hlsRef.current = null;
       recoveryRef.current?.dispose();
@@ -486,14 +769,17 @@ export function PlayerShell({
     if (firstAdFilterRef.current) { firstAdFilterRef.current = false; return; }
     if (artRef.current && hlsRef.current) {
       // 用当前实际媒体地址：代理回退生效时切广告过滤不应跳回直连形式
-      loadEpisode(currentMediaUrlRef.current || propsRef.current.url);
+      loadEpisode(currentMediaUrlRef.current || propsRef.current.url, false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adFilter]);
 
+  const activeOption = quality.options.find((option) => option.levelIndexes.includes(quality.active));
+
   return (
-    <div className="relative w-full h-full">
-      <div ref={containerRef} className="w-full h-full" style={{ WebkitTouchCallout: 'none' }} />
+    <div className="w-full">
+      <div className="relative aspect-video bg-black">
+        <div ref={containerRef} className="w-full h-full" style={{ WebkitTouchCallout: 'none' }} />
       {showPoster && !error && (
         <div
           className="absolute inset-0 bg-black pointer-events-none"
@@ -523,6 +809,135 @@ export function PlayerShell({
           自动连播已开启
         </div>
       )}
+      </div>
+      <div className="border-t border-line bg-surface px-3 py-2 text-xs text-muted">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <span>
+            实际画面 <strong className="font-medium tabular-nums text-content">{actualDimensions ?? '读取中'}</strong>
+          </span>
+          {qualityRates.media ? (
+            <span title="根据最近三个视频分片的实际字节数和播放时长估算，包含容器及其中的音频；不能单独代表画面细节。">
+              分片码率约 <span className="tabular-nums">{qualityRates.media}</span>
+            </span>
+          ) : null}
+          {qualityRates.download ? (
+            <span title="最近一次分片实际传输速度，与视频自身码率不同。">
+              本次下载 <span className="tabular-nums">{qualityRates.download}</span>
+            </span>
+          ) : qualityRates.cached ? <span>本次从本地缓存读取</span> : null}
+          {quality.ready && quality.options.length > 1 ? (
+            <label className="ml-auto flex flex-wrap items-center gap-2">
+              <span>版本 <span className="text-faint">（来源标注）</span></span>
+              <select
+                className="max-w-full rounded-md border border-line bg-chip px-2 py-1 text-xs text-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+                aria-label="选择画质版本，选项为来源标注"
+                title="版本切换在后续片段生效；实际画面尺寸以左侧显示为准。"
+                value={quality.selected === -1 ? 'auto' : quality.selected}
+                onChange={(event) => selectQuality(event.target.value)}
+              >
+                <option value="auto">自动{activeOption ? `（当前 ${activeOption.label}）` : ''}</option>
+                {quality.options.map((option) => (
+                  <option key={option.levelIndex} value={option.levelIndex}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+        </div>
+        {quality.ready && quality.options.length === 1 ? (
+          <p className="mt-1.5 text-faint">当前视频仅提供一个清晰度档位，想更清晰可切换资源。</p>
+        ) : null}
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-line pt-2">
+          <label className="flex items-center gap-1.5 cursor-pointer" title="按设定秒数跳过，不自动识别广告；修改设置从下次播放或下一集生效。">
+            <input
+              type="checkbox"
+              checked={introPreferences.enabled}
+              onChange={(event) => updateIntroPreferences({ enabled: event.target.checked })}
+            />
+            自动跳过片头
+          </label>
+          <label className="flex items-center gap-1.5">
+            <select
+              className="rounded border border-line bg-chip px-1.5 py-1 text-xs text-content"
+              aria-label="片头跳过时长"
+              value={customIntroSeconds || !INTRO_SKIP_PRESETS.includes(introPreferences.seconds) ? 'custom' : introPreferences.seconds}
+              onChange={(event) => {
+                if (event.target.value === 'custom') setCustomIntroSeconds(true);
+                else {
+                  setCustomIntroSeconds(false);
+                  updateIntroPreferences({ seconds: Number(event.target.value) });
+                }
+              }}
+            >
+              {INTRO_SKIP_PRESETS.map((seconds) => <option key={seconds} value={seconds}>{seconds} 秒</option>)}
+              <option value="custom">自定秒数</option>
+            </select>
+            {customIntroSeconds || !INTRO_SKIP_PRESETS.includes(introPreferences.seconds) ? (
+              <>
+                <input
+                  type="number"
+                  className="w-16 rounded border border-line bg-chip px-1.5 py-1 text-xs tabular-nums text-content"
+                  min={0}
+                  max={600}
+                  step={1}
+                  aria-label="自定片头秒数，零至六百秒"
+                  value={introPreferences.seconds}
+                  onChange={(event) => updateIntroPreferences({ seconds: Number(event.target.value) })}
+                />
+                <span>秒</span>
+              </>
+            ) : null}
+          </label>
+          <button className="btn-ghost text-xs px-2 py-1" onClick={skipIntroNow} disabled={introPreferences.seconds === 0}>
+            跳过片头
+          </button>
+          <span className="text-faint">按设定秒数跳过 · 设置下次生效</span>
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2">
+          <label className="flex items-center gap-1.5 cursor-pointer" title="进入设定的片尾区间后直接播放下一集，需要开启自动连播；短视频会保留至少30秒正片。">
+            <input
+              type="checkbox"
+              checked={outroPreferences.enabled}
+              onChange={(event) => updateOutroPreferences({ enabled: event.target.checked })}
+            />
+            自动跳过片尾
+          </label>
+          <label className="flex items-center gap-1.5">
+            <select
+              className="rounded border border-line bg-chip px-1.5 py-1 text-xs text-content"
+              aria-label="片尾跳过时长"
+              value={customOutroSeconds || !INTRO_SKIP_PRESETS.includes(outroPreferences.seconds) ? 'custom' : outroPreferences.seconds}
+              onChange={(event) => {
+                if (event.target.value === 'custom') setCustomOutroSeconds(true);
+                else {
+                  setCustomOutroSeconds(false);
+                  updateOutroPreferences({ seconds: Number(event.target.value) });
+                }
+              }}
+            >
+              {INTRO_SKIP_PRESETS.map((seconds) => <option key={seconds} value={seconds}>{seconds} 秒</option>)}
+              <option value="custom">自定秒数</option>
+            </select>
+            {customOutroSeconds || !INTRO_SKIP_PRESETS.includes(outroPreferences.seconds) ? (
+              <>
+                <input
+                  type="number"
+                  className="w-16 rounded border border-line bg-chip px-1.5 py-1 text-xs tabular-nums text-content"
+                  min={0}
+                  max={600}
+                  step={1}
+                  aria-label="自定片尾秒数，零至六百秒"
+                  value={outroPreferences.seconds}
+                  onChange={(event) => updateOutroPreferences({ seconds: Number(event.target.value) })}
+                />
+                <span>秒</span>
+              </>
+            ) : null}
+          </label>
+          <span className="text-faint">
+            {!nextUrl ? '没有下一集，将自然播完' : !autoplayNext ? '需开启自动连播' : '按设定秒数跳过，直接播放下一集'}
+          </span>
+        </div>
+      </div>
     </div>
   );
 }

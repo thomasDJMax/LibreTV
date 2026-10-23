@@ -22,10 +22,10 @@ export function useFocusTrap(active: boolean, containerRef: RefObject<HTMLElemen
     const panel = containerRef.current;
     if (panel) {
       const first = panel.querySelector<HTMLElement>(FOCUSABLE);
-      (first ?? panel).focus();
+      (first ?? panel).focus({ preventScroll: true });
     }
     return () => {
-      restoreRef.current?.focus?.();
+      restoreRef.current?.focus?.({ preventScroll: true });
       restoreRef.current = null;
     };
   }, [active, containerRef]);

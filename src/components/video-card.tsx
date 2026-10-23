@@ -1,70 +1,20 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { memo, useEffect, useMemo, useState } from 'react';
 import type { SearchResultItem } from '@/lib/types';
 import { useAppStore } from '@/lib/store';
 import { cn } from '@/lib/utils';
 import { SmartImage } from './smart-image';
 
-// —— 跨源同名聚合 ——
-
-export interface AggregatedGroup {
-  key: string;
-  name: string;
-  year?: string;
-  typeName?: string;
-  pic?: string;
-  remarks?: string;
-  items: SearchResultItem[];
-}
-
-function buildGroup(name: string, year: string | undefined, items: SearchResultItem[]): AggregatedGroup {
-  return {
-    key: `${name}|${year ?? ''}|${items.map((i) => `${i.sourceKey}_${i.vodId}`).join(',')}`,
-    name,
-    year,
-    typeName: items.find((i) => i.typeName)?.typeName,
-    pic: items.find((i) => i.pic)?.pic,
-    remarks: items.find((i) => i.remarks)?.remarks,
-    items,
-  };
-}
-
-/**
- * 把扁平的跨源搜索结果按「同名影片」聚合：
- * - 以名称分桶；桶内年份不一致时（同名翻拍）按年份拆分，无年份的条目并入年份桶；
- * - 保持传入顺序（搜索结果已按名称排序）。
- */
-export function aggregateResults(list: SearchResultItem[]): AggregatedGroup[] {
-  const byName = new Map<string, SearchResultItem[]>();
-  for (const item of list) {
-    const k = (item.name || '').trim();
-    if (!k) continue;
-    if (!byName.has(k)) byName.set(k, []);
-    byName.get(k)!.push(item);
-  }
-  const groups: AggregatedGroup[] = [];
-  for (const [name, items] of byName) {
-    const years = [...new Set(items.map((i) => i.year).filter(Boolean))] as string[];
-    if (years.length > 1) {
-      for (const y of years) {
-        groups.push(buildGroup(name, y, items.filter((i) => i.year === y)));
-      }
-      const noYear = items.filter((i) => !i.year);
-      if (noYear.length) groups.push(buildGroup(name, undefined, noYear));
-    } else {
-      groups.push(buildGroup(name, years[0], items));
-    }
-  }
-  return groups;
-}
+import type { AggregatedGroup } from '@/lib/search-results';
+export { aggregateResults } from '@/lib/search-results';
 
 /**
  * 聚合影片卡片：
  * - 单源：点击直接打开该源详情（与旧体验一致）；
  * - 多源：显示「N 个来源」徽章，点击展开各源列表，选择具体源后打开详情。
  */
-export function AggregatedCard({
+export const AggregatedCard = memo(function AggregatedCard({
   group,
   onOpen,
 }: {
@@ -86,7 +36,7 @@ export function AggregatedCard({
   };
 
   return (
-    <div className={cn('card', !multi && 'hover:scale-[1.02] hover:shadow-md', multi && expanded && 'ring-1 ring-accent/40')}>
+    <div className={cn('card', !multi && 'hover:scale-[1.02]', multi && expanded && 'ring-1 ring-accent/40')}>
       {/* 不用 h-full：展开面板需要撑高卡片，等高裁切会让面板不可见 */}
       <div
         className="flex h-full cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/60"
@@ -171,7 +121,7 @@ export function AggregatedCard({
                 key={`${item.sourceKey}_${item.vodId}`}
                 className={cn(
                   'group inline-flex items-center gap-1.5 max-w-full rounded-lg border px-2.5 py-1.5',
-                  'text-xs transition-all cursor-pointer',
+                  'text-xs transition-colors cursor-pointer',
                   'border-line bg-chip hover:border-accent hover:bg-accent/10',
                   item.isAdult && 'border-pink-500/30'
                 )}
@@ -198,7 +148,7 @@ export function AggregatedCard({
       )}
     </div>
   );
-}
+});
 
 /** 影片卡片：封面加载失败时逐级降级到占位图（未聚合的单一结果使用） */
 export function VideoCard({ item, onClick }: { item: SearchResultItem; onClick: () => void }) {
@@ -209,7 +159,7 @@ export function VideoCard({ item, onClick }: { item: SearchResultItem; onClick: 
 
   return (
     <div
-      className="card cursor-pointer hover:scale-[1.02] hover:shadow-md h-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+      className="card cursor-pointer hover:scale-[1.02] h-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
       role="button"
       tabIndex={0}
       onClick={onClick}
@@ -271,7 +221,7 @@ export function DoubanCard({ item, onClick }: { item: { title: string; cover: st
 
   return (
     <div
-      className="card cursor-pointer hover:scale-[1.03] hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+      className="card cursor-pointer hover:scale-[1.03] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
       role="button"
       tabIndex={0}
       onClick={onClick}

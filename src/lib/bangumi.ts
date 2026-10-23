@@ -1,5 +1,6 @@
 import type { DoubanItem } from './types';
-import { fetchUpstream, getCache, setCache } from './fetch-utils';
+import { getCache, setCache } from './fetch-utils';
+import { fetchBangumi } from './bangumi-request';
 
 /**
  * Bangumi 每日放送（新番时间表）数据获取。
@@ -62,7 +63,7 @@ export async function fetchBangumiCalendar(): Promise<Record<number, DoubanItem[
   const cached = getCache<Record<number, DoubanItem[]>>(BANGUMI_API);
   if (cached) return cached;
 
-  const res = await fetchUpstream(BANGUMI_API, {
+  const res = await fetchBangumi(BANGUMI_API, {
     timeoutMs: 8000,
     headers: { 'User-Agent': UA, Accept: 'application/json' },
   });

@@ -30,6 +30,7 @@ import {
   db,
 } from '@/lib/db';
 import { cn } from '@/lib/utils';
+import { isMovieVersionList, playbackEntryLabel } from '@/lib/playback-navigation';
 
 /**
  * 播放页（唯一入口，替代旧版 watch.html → player.html 跳转链）。
@@ -73,6 +74,8 @@ function WatchContent() {
   });
 
   const episodes = useMemo(() => detailQuery.data?.episodes ?? [], [detailQuery.data]);
+  const episodeLabels = detailQuery.data?.episodeLabels;
+  const movieVersions = isMovieVersionList(detailQuery.data?.videoInfo?.typeName, episodeLabels);
   const videoTitle = titleParam || detailQuery.data?.videoInfo?.title || '未知视频';
 
   // 当前播放地址：优先取剧集列表中的当前集，其次直连 URL 参数
@@ -88,6 +91,8 @@ function WatchContent() {
     if (episodes.length > 0) return Math.min(Math.max(indexParam, 0), episodes.length - 1);
     return indexParam;
   }, [episodes, indexParam]);
+  const currentEntryLabel = playbackEntryLabel(episodeLabels, currentIndex, movieVersions);
+  const hasNextEpisode = !movieVersions && currentIndex + 1 < episodes.length;
 
   const goEpisode = useCallback(
     (index: number) => {
@@ -141,18 +146,13 @@ function WatchContent() {
     [sourceKey, vodId, currentIndex, currentUrl]
   );
 
-  // 自动连播的 800ms 延迟切集要在卸载时取消，避免离开页面后跳转
-  const autoNextTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => {
-    if (autoNextTimer.current) clearTimeout(autoNextTimer.current);
-  }, []);
-
+  // 自然播完或跳过片尾后立即切集，不再额外等待固定延迟。
   const handleEnded = useCallback(() => {
     if (vodId) clearProgress(sourceKey, vodId, currentIndex).catch(() => {});
-    if (store.autoplayNext && currentIndex < episodes.length - 1) {
-      autoNextTimer.current = setTimeout(() => goEpisode(currentIndex + 1), 800);
+    if (!movieVersions && store.autoplayNext && currentIndex < episodes.length - 1) {
+      goEpisode(currentIndex + 1);
     }
-  }, [store.autoplayNext, currentIndex, episodes.length, goEpisode, sourceKey, vodId]);
+  }, [movieVersions, store.autoplayNext, currentIndex, episodes.length, goEpisode, sourceKey, vodId]);
 
   // Alt+←/→ 集数切换快捷键
   useEffect(() => {
@@ -180,7 +180,7 @@ function WatchContent() {
     );
   }
 
-  if (!source) {
+  if (!source && (!directUrl || vodId)) {
     return (
       <div className="min-h-screen flex items-center justify-center px-4">
         <div className="text-center max-w-md">
@@ -203,8 +203,8 @@ function WatchContent() {
           <div className="min-w-0">
             <h1 className="text-sm font-medium text-content truncate">{videoTitle}</h1>
             <p className="text-xs text-faint">
-              {source.name}
-              {episodes.length > 0 && ` · 第 ${currentIndex + 1}/${episodes.length} 集`}
+              {source?.name || '视频直链'}
+              {episodes.length > 0 && ` · ${movieVersions ? '当前版本：' : ''}${currentEntryLabel}（${currentIndex + 1}/${episodes.length}）`}
             </p>
           </div>
           <div className="ml-auto flex items-center gap-2">
@@ -214,15 +214,15 @@ function WatchContent() {
                 if (!currentUrl) return;
                 enqueueDownload({
                   url: currentUrl,
-                  // 多集才带集数后缀；单集影片（含电影）文件名就是纯标题
-                  title: `${videoTitle}${episodes.length > 1 ? ` 第${currentIndex + 1}集` : ''}`,
+                  // Preserve language editions and merged episode labels in filenames.
+                  title: `${videoTitle}${episodes.length > 1 ? ` ${currentEntryLabel}` : ''}`,
                   format: 'MP4',
                 });
                 // 「已加入下载队列」由 DownloadManager 在真正入队后提示：
                 // 这里先提示的话，用户随后取消保存位置会出现「已加入→已取消」的矛盾
               }}
             >
-              下载本集
+              {movieVersions ? '下载本版本' : '下载本集'}
             </button>
             <button className="btn-ghost btn-sm" onClick={() => setSwitchOpen(true)}>
               切换资源
@@ -234,23 +234,23 @@ function WatchContent() {
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-4">
         <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-4">
           <div>
-            <div className="aspect-video bg-black rounded-lg overflow-hidden">
+            <div className="bg-black rounded-lg overflow-hidden">
               {currentUrl ? (
                 <PlayerShell
                   url={currentUrl}
                   title={videoTitle}
                   adFilter={store.adFilter}
-                  autoplayNext={store.autoplayNext}
-                  episodeKey={`${sourceKey}:${vodId}:${currentIndex}`}
-                  nextUrl={currentIndex + 1 < episodes.length ? episodes[currentIndex + 1] : undefined}
-                  nextEpisodeKey={currentIndex + 1 < episodes.length ? `${sourceKey}:${vodId}:${currentIndex + 1}` : undefined}
+                  autoplayNext={store.autoplayNext && !movieVersions}
+                  episodeKey={sourceKey && vodId ? `${sourceKey}:${vodId}:${currentIndex}` : undefined}
+                  nextUrl={hasNextEpisode ? episodes[currentIndex + 1] : undefined}
+                  nextEpisodeKey={hasNextEpisode && sourceKey && vodId ? `${sourceKey}:${vodId}:${currentIndex + 1}` : undefined}
                   getRestorePosition={getRestorePosition}
                   onTimeUpdate={handleProgress}
                   onPause={handleProgress}
                   onEnded={handleEnded}
                 />
               ) : (
-                <div className="w-full h-full flex items-center justify-center">
+                <div className="aspect-video w-full flex items-center justify-center">
                   {detailQuery.isLoading ? (
                     <Spinner size="lg" />
                   ) : (
@@ -269,24 +269,28 @@ function WatchContent() {
                 disabled={currentIndex <= 0}
                 onClick={() => goEpisode(currentIndex - 1)}
               >
-                上一集
+                {movieVersions ? '上一版本' : '上一集'}
               </button>
               <button
                 className="btn-ghost btn-sm"
                 disabled={episodes.length === 0 || currentIndex >= episodes.length - 1}
                 onClick={() => goEpisode(currentIndex + 1)}
               >
-                下一集
+                {movieVersions ? '下一版本' : '下一集'}
               </button>
-              <label className="flex items-center gap-1.5 text-xs text-muted ml-auto cursor-pointer">
-                <input
-                  type="checkbox"
-                  className="h-3.5 w-3.5 accent-[#2563eb]"
-                  checked={store.autoplayNext}
-                  onChange={(e) => store.updateSettings({ autoplayNext: e.target.checked })}
-                />
-                自动连播
-              </label>
+              {movieVersions ? (
+                <span className="text-xs text-muted ml-auto">同一电影的不同版本，请手动选择</span>
+              ) : (
+                <label className="flex items-center gap-1.5 text-xs text-muted ml-auto cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-[#2563eb]"
+                    checked={store.autoplayNext}
+                    onChange={(e) => store.updateSettings({ autoplayNext: e.target.checked })}
+                  />
+                  自动连播
+                </label>
+              )}
             </div>
           </div>
 
@@ -294,7 +298,7 @@ function WatchContent() {
           <aside className="bg-surface-raised rounded-lg p-3 h-fit">
             <div className="flex items-center justify-between gap-2 mb-2.5">
               <h2 className="text-sm font-semibold text-content">
-                剧集列表{episodes.length > 0 && `（${episodes.length}）`}
+                {movieVersions ? '版本列表' : '剧集列表'}{episodes.length > 0 && `（${episodes.length}）`}
               </h2>
               {/* 排列开关紧贴它所作用的列表：放在这里才看得出它管的是这一栏的顺序 */}
               {episodes.length > 1 && (
@@ -302,7 +306,7 @@ function WatchContent() {
                   className="btn-ghost btn-sm shrink-0"
                   onClick={() => setReversed((v) => !v)}
                   aria-label={reversed ? '切换为正序排列' : '切换为倒序排列'}
-                  title="调整剧集列表的排列顺序"
+                  title={`调整${movieVersions ? '版本' : '剧集'}列表的排列顺序`}
                 >
                   <Icon
                     name="arrowDown"
@@ -316,14 +320,14 @@ function WatchContent() {
               detailQuery.isLoading ? (
                 <LoadingState />
               ) : (
-                <EmptyState variant="plain" title={detailQuery.isError ? '获取剧集失败' : '暂无剧集信息'} />
+                <EmptyState variant="plain" title={detailQuery.isError ? '获取播放列表失败' : '暂无播放列表'} />
               )
             ) : (
-              <div className="grid grid-cols-5 lg:grid-cols-4 gap-1.5 max-h-[65vh] overflow-y-auto scrollbar-thin pr-1">
+              <div className={cn('grid gap-1.5 max-h-[65vh] overflow-y-auto scrollbar-thin pr-1', movieVersions ? 'grid-cols-2' : 'grid-cols-5 lg:grid-cols-4')}>
                 {orderedEpisodes.map((realIndex) => (
                   <EpisodeButton
                     key={realIndex}
-                    index={realIndex}
+                    label={playbackEntryLabel(episodeLabels, realIndex, movieVersions)}
                     active={realIndex === currentIndex}
                     onClick={() => goEpisode(realIndex)}
                   />
@@ -331,7 +335,7 @@ function WatchContent() {
               </div>
             )}
             <p className="hidden md:block text-[10px] text-faint mt-3 leading-relaxed">
-              快捷键：空格 播放/暂停 · ←/→ 快退/快进 5s · ↑/↓ 音量 · F 全屏 · Alt+←/→ 切换集数
+              快捷键：空格 播放/暂停 · ←/→ 快退/快进 5s · ↑/↓ 音量 · F 全屏 · Alt+←/→ 切换{movieVersions ? '版本' : '集数'}
             </p>
           </aside>
         </div>
@@ -343,6 +347,10 @@ function WatchContent() {
           currentSourceKey={sourceKey}
           currentVodId={vodId}
           currentIndex={currentIndex}
+          currentYear={detailQuery.data?.videoInfo?.year}
+          currentTypeName={detailQuery.data?.videoInfo?.typeName}
+          currentEpisodeLabel={detailQuery.data?.episodeLabels?.[currentIndex]}
+          currentEpisodeCount={episodes.length}
           onClose={() => setSwitchOpen(false)}
         />
       )}
@@ -351,7 +359,7 @@ function WatchContent() {
 }
 
 /** 集数按钮：激活时自动滚动进可视区（长剧列表） */
-function EpisodeButton({ index, active, onClick }: { index: number; active: boolean; onClick: () => void }) {
+function EpisodeButton({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
   const ref = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
@@ -361,10 +369,12 @@ function EpisodeButton({ index, active, onClick }: { index: number; active: bool
   return (
     <button
       ref={ref}
-      className={cn('btn btn-sm !px-1', active ? 'episode-active' : 'btn-ghost')}
+      className={cn('btn btn-sm !px-1 whitespace-normal break-words min-h-9', active ? 'episode-active' : 'btn-ghost')}
+      title={label}
+      aria-label={`播放 ${label}`}
       onClick={onClick}
     >
-      {index + 1}
+      {label}
     </button>
   );
 }

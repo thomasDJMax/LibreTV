@@ -56,18 +56,29 @@ export function Drawer({
   // 进入：先挂载（保持 slide-out 初态）再于下一帧切换为进入态，触发过渡
   // 退出：先回到初态，过渡结束后卸载并归还焦点
   useEffect(() => {
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     if (open) {
       restoreFocusRef.current = document.activeElement as HTMLElement | null;
       setMounted(true);
-      const raf = requestAnimationFrame(() => requestAnimationFrame(() => setEntered(true)));
-      return () => cancelAnimationFrame(raf);
+      if (reducedMotion) {
+        setEntered(true);
+        return;
+      }
+      let enterFrame = 0;
+      const mountFrame = requestAnimationFrame(() => {
+        enterFrame = requestAnimationFrame(() => setEntered(true));
+      });
+      return () => {
+        cancelAnimationFrame(mountFrame);
+        cancelAnimationFrame(enterFrame);
+      };
     }
     setEntered(false);
     const timer = setTimeout(() => {
       setMounted(false);
-      restoreFocusRef.current?.focus?.();
+      restoreFocusRef.current?.focus?.({ preventScroll: true });
       restoreFocusRef.current = null;
-    }, EXIT_MS);
+    }, reducedMotion ? 0 : EXIT_MS);
     return () => clearTimeout(timer);
   }, [open]);
 
@@ -87,7 +98,7 @@ export function Drawer({
     const panel = panelRef.current;
     if (!panel) return;
     const first = panel.querySelector<HTMLElement>(FOCUSABLE);
-    (first ?? panel).focus();
+    (first ?? panel).focus({ preventScroll: true });
   }, [mounted]);
 
   // Esc 关闭 + Tab 循环（焦点不逃逸到背景页面）
@@ -135,7 +146,7 @@ export function Drawer({
     <div className="fixed inset-0 z-50">
       <div
         className={cn(
-          'absolute inset-0 bg-black/60 transition-opacity duration-200',
+          'absolute inset-0 bg-black/60 transition-opacity duration-200 motion-reduce:duration-0',
           entered ? 'opacity-100' : 'opacity-0'
         )}
         onClick={closeOnOverlay ? onClose : undefined}
@@ -149,7 +160,7 @@ export function Drawer({
         tabIndex={-1}
         className={cn(
           'absolute right-0 top-0 h-full w-full bg-surface-raised border-l border-line flex flex-col outline-none',
-          'transition-transform duration-200 ease-out',
+          'transition-transform duration-200 ease-out motion-reduce:duration-0',
           width,
           entered ? 'translate-x-0' : 'translate-x-full'
         )}
@@ -166,7 +177,7 @@ export function Drawer({
         </div>
         {subheader && <div className="shrink-0 px-4 py-2.5 border-b border-line bg-surface-raised">{subheader}</div>}
         {/* 唯一滚动区：内容再长也只在这一层滚动，避免与列表内滚形成嵌套滚动 */}
-        <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto scrollbar-thin px-4 pt-4 pb-6">
+        <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto overscroll-contain scrollbar-thin px-4 pt-4 pb-6">
           {children}
         </div>
       </div>

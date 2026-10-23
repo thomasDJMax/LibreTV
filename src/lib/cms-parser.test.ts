@@ -91,6 +91,14 @@ describe('extractM3u8FromText', () => {
 });
 
 describe('parseDetail', () => {
+  it('保留实际 m3u8 线路的集标签，与过滤后的地址一一对应', () => {
+    const detail = parseDetail({ list: [{
+      vod_play_url: '网页$https://example.com/share/1$$$第161集$https://cdn/161.m3u8#预告$ftp://cdn/trailer#第163集$https://cdn/163.m3u8?token=a$b',
+    }] }, source);
+    expect(detail.episodeLabels).toEqual(['第161集', '第163集']);
+    expect(detail.episodes).toEqual(['https://cdn/161.m3u8', 'https://cdn/163.m3u8?token=a$b']);
+  });
+
   it('解析详情并提取分集', () => {
     const data = {
       list: [{

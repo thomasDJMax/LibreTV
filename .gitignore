@@ -12,3 +12,7 @@ vitest-results.json
 .zcode/
 .codebuddy/
 generated-images/
+
+# 本机部署、探测记录、配置备份和系统文件
+.local/
+.DS_Store

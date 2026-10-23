@@ -51,7 +51,7 @@ export function parseSearchList(
  * 部分源（如量子 lziapi、非凡 ffzy）第一条线路是网页中转页（…/share/xxx，不可播），
  * 真实 m3u8 在后面的线路里，因此优先取包含 m3u8 直链的线路；均无 m3u8 时回退第一条。
  */
-export function extractEpisodesFromPlayUrl(playUrl: string): string[] {
+function extractEpisodeEntries(playUrl: string): { url: string; label: string }[] {
   if (!playUrl) return [];
   const groups = playUrl
     .split('$$$')
@@ -59,14 +59,21 @@ export function extractEpisodesFromPlayUrl(playUrl: string): string[] {
       group
         .split('#')
         .map((ep) => {
-          const parts = ep.split('$');
-          return parts.length > 1 ? parts[1] : '';
+          const separator = ep.indexOf('$');
+          return {
+            label: separator < 0 ? '' : ep.slice(0, separator).trim(),
+            url: separator < 0 ? '' : ep.slice(separator + 1).trim(),
+          };
         })
-        .filter((url) => url.startsWith('http://') || url.startsWith('https://'))
+        .filter((ep) => /^https?:\/\//.test(ep.url))
     )
     .filter((eps) => eps.length > 0);
   if (groups.length === 0) return [];
-  return groups.find((eps) => eps.some((url) => url.includes('.m3u8'))) ?? groups[0];
+  return groups.find((eps) => eps.some((ep) => /\.m3u8(?:[?#]|$)/i.test(ep.url))) ?? groups[0];
+}
+
+export function extractEpisodesFromPlayUrl(playUrl: string): string[] {
+  return extractEpisodeEntries(playUrl).map((entry) => entry.url);
 }
 
 /** 从简介文本中兜底提取 m3u8 链接 */
@@ -86,12 +93,14 @@ export function parseDetail(
     throw new Error('获取到的详情内容无效');
   }
   const vod = d.list[0];
-  let episodes = extractEpisodesFromPlayUrl(String(vod.vod_play_url ?? ''));
+  const entries = extractEpisodeEntries(String(vod.vod_play_url ?? ''));
+  let episodes = entries.map((entry) => entry.url);
   if (episodes.length === 0) {
     episodes = extractM3u8FromText(String(vod.vod_content ?? ''));
   }
   return {
     episodes,
+    ...(entries.length ? { episodeLabels: entries.map((entry) => entry.label) } : {}),
     videoInfo: {
       title: str(vod.vod_name),
       cover: str(vod.vod_pic),

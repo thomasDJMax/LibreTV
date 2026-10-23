@@ -1,6 +1,7 @@
 'use client';
 
-import type { SearchResponse, SearchStreamEvent, SourceSearchOutcome, VideoDetail, DoubanResponse, BangumiCalendarResponse, AuthStatusResponse, SourceConfig, SearchResultItem, LivePlaylistResponse, LiveEpgResponse, SourceListPayload } from './types';
+import type { AnimeCatalogQuery, AnimeCatalogResponse } from './anime-catalog-types';
+import type { SearchResponse, SearchStreamEvent, SourceSearchOutcome, VideoDetail, VodQualityResult, DoubanResponse, BangumiCalendarResponse, AuthStatusResponse, SourceConfig, SearchResultItem, LivePlaylistResponse, LiveEpgResponse, SourceListPayload } from './types';
 
 /**
  * 客户端 API 封装。401 时触发全局事件打开登录框，
@@ -154,7 +155,12 @@ export const api = {
   /** Bangumi 每日放送（免 key），首页推荐的另一数据源 */
   bangumiCalendar: (signal?: AbortSignal) => request<BangumiCalendarResponse>('/api/bangumi/calendar', { signal }),
 
-  /** 影视热榜（60s API 免 key）：豆瓣周榜五个类目 + 百度热播剧 */
+  animeCatalog: (query: AnimeCatalogQuery, signal?: AbortSignal) => {
+    const sp = new URLSearchParams({ category: query.category, sort: query.sort, year: query.year === null ? 'all' : String(query.year), keyword: query.keyword, page: String(query.page) });
+    return request<AnimeCatalogResponse>(`/api/anime?${sp}`, { signal });
+  },
+
+  /** 豆瓣周榜、韩剧口碑榜与百度热播剧。 */
   hotList: (id: string, signal?: AbortSignal) => {
     const sp = new URLSearchParams({ id });
     return request<DoubanResponse>(`/api/hot-list?${sp.toString()}`, { signal });
@@ -170,6 +176,15 @@ export const api = {
       return { ok: false, ms: Math.round(performance.now() - start), detail: undefined as VideoDetail | undefined, error: err instanceof Error ? err.message : '失败' };
     }
   },
+
+  /** 换源时按需检查当前集的一小段码流，不把清单标注当作实际画质。 */
+  vodQuality: (url: string, signal?: AbortSignal) =>
+    request<VodQualityResult>('/api/vod/quality', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+      signal,
+    }),
 
   /** 点播源探活：以搜索 "test" 的耗时与结果量衡量可用性 */
   testSource: (url: string) =>

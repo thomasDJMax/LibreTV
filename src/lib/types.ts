@@ -42,13 +42,33 @@ export interface VideoInfo {
 
 export interface VideoDetail {
   episodes: string[];
+  /** 与 episodes 一一对应的源站集标签；旧数据和 HTML 兜底可能缺失。 */
+  episodeLabels?: string[];
   videoInfo: VideoInfo;
+}
+
+/** 点播画质抽样。真实宽高只来自码流，清单声明不能代替解码证据。 */
+export interface VodQualityResult {
+  url: string;
+  ok: boolean;
+  width?: number;
+  height?: number;
+  codec?: string;
+  /** 首个视频分片的估算媒体码率，含音频和容器，并非下载速度。 */
+  mediaKbps?: number;
+  variantCount?: number;
+  sampleHash?: string;
+  ms?: number;
+  error?: string;
+  evidence?: 'bitstream' | 'manifest' | 'unknown';
 }
 
 export interface DoubanItem {
   id: string;
   title: string;
   cover: string;
+  /** 榜单原始名次；普通推荐及旧缓存可能没有。 */
+  rank?: number;
   rating?: string;
   isTv?: boolean;
 }

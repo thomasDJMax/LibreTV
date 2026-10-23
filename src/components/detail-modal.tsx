@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/client-api';
 import type { SearchResultItem, VideoDetail } from '@/lib/types';
@@ -14,14 +14,16 @@ import { copyToClipboard } from '@/lib/clipboard';
 import { EmptyState, ErrorState, LoadingState } from './states';
 import { useFocusTrap } from './use-focus-trap';
 import { Icon } from './icon';
+import { isMovieVersionList, playbackEntryLabel } from '@/lib/playback-navigation';
 
 /**
  * 详情弹窗：剧集列表 + 排序 + 复制链接。
  * 剧集点击 → /watch 路由（URL 携带定位参数，可分享、可后退）。
  */
 
-export function DetailModal({ item, onClose }: { item: SearchResultItem | null; onClose: () => void }) {
-  const store = useAppStore();
+export const DetailModal = memo(function DetailModal({ item, onClose }: { item: SearchResultItem | null; onClose: () => void }) {
+  const imageProxyMode = useAppStore((s) => s.imageProxyMode);
+  const customImageProxy = useAppStore((s) => s.customImageProxy);
   const router = useRouter();
   const { toast } = useToast();
   const [detail, setDetail] = useState<VideoDetail | null>(null);
@@ -35,7 +37,7 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
   // 打开时把焦点移入弹窗、Tab 圈闭在弹窗内、关闭后归还焦点
   useFocusTrap(Boolean(item), panelRef);
 
-  useEffect(() => setPosterFailed(false), [item?.pic, store.imageProxyMode, store.customImageProxy]);
+  useEffect(() => setPosterFailed(false), [item?.pic, imageProxyMode, customImageProxy]);
 
   // 弹窗打开期间锁定背景滚动
   useEffect(() => {
@@ -53,7 +55,7 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
       setError('');
       return;
     }
-    const source = resolveSource(store, item.sourceKey, {
+    const source = resolveSource(useAppStore.getState(), item.sourceKey, {
       url: item.sourceUrl,
       name: item.sourceName,
     });
@@ -75,7 +77,6 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
       })
       .finally(() => setLoading(false));
     return () => controller.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [item]);
 
   useEffect(() => {
@@ -91,6 +92,7 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
 
   const episodes = detail ? (reversed ? [...detail.episodes].reverse() : detail.episodes) : [];
   const info = detail?.videoInfo;
+  const movieVersions = isMovieVersionList(info?.typeName ?? item.typeName, detail?.episodeLabels);
 
   const play = (index: number) => {
     if (!detail || !detail.episodes[index]) return;
@@ -124,7 +126,7 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto bg-black/80 py-10 px-4 animate-fade-in"
+      className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto overscroll-contain bg-black/80 py-10 px-4"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -154,7 +156,7 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
         </div>
 
         <div className="p-5 pt-4">
-          {loading && <LoadingState label="正在获取剧集信息..." />}
+          {loading && <LoadingState label="正在获取播放信息..." />}
 
           {!loading && error && <ErrorState message={error || '获取失败'} />}
 
@@ -164,8 +166,8 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
                 {item?.pic && !posterFailed && (
                   <SmartImage
                     url={item.pic}
-                    mode={store.imageProxyMode}
-                    customProxy={store.customImageProxy}
+                    mode={imageProxyMode}
+                    customProxy={customImageProxy}
                     alt={item.name}
                     className="w-24 sm:w-32 aspect-[2/3] object-cover rounded-lg bg-chip shrink-0 self-center sm:self-start"
                     loading="eager"
@@ -197,7 +199,7 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
                         className="btn-ghost btn-sm"
                         onClick={() => setReversed((v) => !v)}
                         aria-label={reversed ? '切换为正序排列' : '切换为倒序排列'}
-                        title="调整剧集列表的排列顺序"
+                        title={`调整${movieVersions ? '版本' : '剧集'}列表的排列顺序`}
                       >
                         <Icon
                           name="arrowDown"
@@ -205,22 +207,23 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
                         />
                         {reversed ? '正序排列' : '倒序排列'}
                       </button>
-                      <span className="text-sm text-faint">共 {episodes.length} 集</span>
+                      <span className="text-sm text-faint">{movieVersions ? `版本列表 · 共 ${episodes.length} 个版本` : `共 ${episodes.length} 集`}</span>
                     </div>
                     <button className="btn-primary btn-sm" onClick={copyLinks}>
                       复制链接
                     </button>
                   </div>
-                  <div className="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-7 gap-2 max-h-[40vh] overflow-y-auto scrollbar-thin pr-1">
+                  <div className={cn('grid gap-2 max-h-[40vh] overflow-y-auto scrollbar-thin pr-1', movieVersions ? 'grid-cols-2 sm:grid-cols-3' : 'grid-cols-3 sm:grid-cols-5 md:grid-cols-7')}>
                     {episodes.map((_, i) => {
                       const realIndex = reversed ? detail.episodes.length - 1 - i : i;
                       return (
                         <button
                           key={realIndex}
-                          className="btn-ghost btn-sm !px-1 text-center"
+                          className="btn-ghost btn-sm !px-1 text-center whitespace-normal break-words min-h-9"
+                          title={playbackEntryLabel(detail.episodeLabels, realIndex, movieVersions)}
                           onClick={() => play(realIndex)}
                         >
-                          {realIndex + 1}
+                          {playbackEntryLabel(detail.episodeLabels, realIndex, movieVersions)}
                         </button>
                       );
                     })}
@@ -239,4 +242,4 @@ export function DetailModal({ item, onClose }: { item: SearchResultItem | null; 
       </div>
     </div>
   );
-}
+});

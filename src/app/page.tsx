@@ -1,12 +1,13 @@
 'use client';
 
-import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
 import { Header } from '@/components/header';
 import { RecommendSection } from '@/components/douban-section';
 import { DetailModal } from '@/components/detail-modal';
 import { AggregatedCard, aggregateResults } from '@/components/video-card';
+import { resolveSearchQuery } from '@/lib/search-results';
 import { useAppStore, resolveSource, isInDisabledSubscription, isSourceDisabled } from '@/lib/store';
 import { api } from '@/lib/client-api';
 import type { SearchResultItem, SourceSearchOutcome } from '@/lib/types';
@@ -37,6 +38,7 @@ function HomeContent() {
   const router = useRouter();
   const { toast } = useToast();
   const urlQuery = searchParams.get('s') || '';
+  const catalogQuery = resolveSearchQuery(urlQuery);
   // 精确订阅所需字段（对齐 live 页的做法）：搜索流式期间逐源写健康度、
   // 打开设置抽屉/历史面板等无关 store 变化，都不应触发首页整树重渲染
   const customAPIs = useAppStore((s) => s.customAPIs);
@@ -47,6 +49,7 @@ function HomeContent() {
   const subscriptions = useAppStore((s) => s.subscriptions);
   const [input, setInput] = useState(urlQuery);
   const [detailItem, setDetailItem] = useState<SearchResultItem | null>(null);
+  const closeDetail = useCallback(() => setDetailItem(null), []);
   /** 流式搜索中已结算的源（data 就绪前用于增量渲染） */
   const [streamedOutcomes, setStreamedOutcomes] = useState<SourceSearchOutcome[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -95,7 +98,7 @@ function HomeContent() {
     // 与 runSearch 的截断规则保持一致：顶栏搜索 / 手动构造长链接不会绕过上限
     queryFn: ({ signal }) => {
       setStreamedOutcomes([]);
-      return api.search(urlQuery.slice(0, 100), selectedSources, yellowFilter, {
+      return api.search(catalogQuery.slice(0, 100), selectedSources, yellowFilter, {
         signal,
         // 逐源结算即更新：结果边搜边渲染，同时滚动健康度
         onSource: (outcome) => {
@@ -156,12 +159,12 @@ function HomeContent() {
       .filter((o) => !o.ok)
       .map((o) => ({ sourceKey: o.sourceKey, error: o.error || '请求失败', timedOut: o.timedOut }));
   // 跨源同名聚合：同名影片合并为一张卡片，展开后可选择具体来源
-  const groups = useMemo(() => aggregateResults(list), [list]);
+  const groups = useMemo(() => aggregateResults(list, catalogQuery), [list, catalogQuery]);
 
-  // 分批渲染：新一次搜索（groups 变化）时重置回首批
+  // 仅切换搜索条件时回到首批；同一次搜索的后续来源到达时保留已展开页数。
   const [visibleCount, setVisibleCount] = useState(RESULT_PAGE_SIZE);
   const visibleGroups = useMemo(() => groups.slice(0, visibleCount), [groups, visibleCount]);
-  useEffect(() => setVisibleCount(RESULT_PAGE_SIZE), [groups]);
+  useEffect(() => setVisibleCount(RESULT_PAGE_SIZE), [urlQuery, selectedKeys, yellowFilter]);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -300,6 +303,8 @@ function HomeContent() {
               </h2>
             </div>
 
+            {catalogQuery !== urlQuery && <p className="mb-3 text-xs text-faint">已按片库名称「{catalogQuery}」检索，可按季选择原版或衍生系列。</p>}
+
             {failures.length > 0 && (
               <div className="mb-3 text-xs bg-chip rounded-lg px-3 py-2 flex flex-wrap gap-x-3 gap-y-1">
                 <span className="text-faint">{isSearching ? '以下源暂时无响应：' : '部分点播源请求失败：'}</span>
@@ -335,7 +340,7 @@ function HomeContent() {
                     <AggregatedCard
                       key={group.key}
                       group={group}
-                      onOpen={(item) => setDetailItem(item)}
+                      onOpen={setDetailItem}
                     />
                   ))}
                 </div>
@@ -376,7 +381,7 @@ function HomeContent() {
 
       <SiteFooter />
 
-      <DetailModal item={detailItem} onClose={() => setDetailItem(null)} />
+      <DetailModal item={detailItem} onClose={closeDetail} />
     </div>
   );
 }
