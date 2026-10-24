@@ -16,3 +16,7 @@ generated-images/
 # 本机部署、探测记录、配置备份和系统文件
 .local/
 .DS_Store
+
+# 桌面配置只能在本机生成，防止误提交个人路径
+desktop/macos/LocalServer.json
+desktop/macos/build/
