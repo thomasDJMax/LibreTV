@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { afterEach, beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
-import { SESSION_COOKIE, checkPassword, checkRateLimit, clearRateLimit, sessionFromCookieHeader, signSession, verifySession } from './auth';
+import { SESSION_COOKIE, checkPassword, checkRateLimit, clearRateLimit, rateLimitKeyFromRequest, sessionFromCookieHeader, signSession, verifySession } from './auth';
 
 /**
  * 会话鉴权单测：HMAC 签名/校验、过期、防篡改、密码恒定时间比较、登录限流。
@@ -123,5 +123,48 @@ describe('checkRateLimit', () => {
     expect(checkRateLimit('1.2.3.4')).toBe(false);
     clearRateLimit('1.2.3.4');
     expect(checkRateLimit('1.2.3.4')).toBe(true);
+  });
+});
+
+describe('rateLimitKeyFromRequest', () => {
+  afterEach(() => {
+    delete process.env.TRUST_PROXY;
+  });
+
+  it('默认不信任转发头，伪造 X-Forwarded-For 无效', () => {
+    const req = new Request('http://localhost/api/auth', {
+      headers: { 'x-forwarded-for': '1.2.3.4', 'x-real-ip': '5.6.7.8' },
+    });
+    expect(rateLimitKeyFromRequest(req)).toBe('direct');
+  });
+
+  it('TRUST_PROXY=true 时取 X-Forwarded-For 的第一段', () => {
+    process.env.TRUST_PROXY = 'true';
+    const req = new Request('http://localhost/api/auth', {
+      headers: { 'x-forwarded-for': '1.2.3.4, 10.0.0.1' },
+    });
+    expect(rateLimitKeyFromRequest(req)).toBe('1.2.3.4');
+  });
+
+  it('TRUST_PROXY=true 时回退到 X-Real-IP', () => {
+    process.env.TRUST_PROXY = 'true';
+    const req = new Request('http://localhost/api/auth', { headers: { 'x-real-ip': '5.6.7.8' } });
+    expect(rateLimitKeyFromRequest(req)).toBe('5.6.7.8');
+  });
+
+  it('TRUST_PROXY 非 true 的取值也不信任', () => {
+    process.env.TRUST_PROXY = '1';
+    const req = new Request('http://localhost/api/auth', { headers: { 'x-forwarded-for': '1.2.3.4' } });
+    expect(rateLimitKeyFromRequest(req)).toBe('direct');
+  });
+});
+
+describe('checkRateLimit 的容量上限', () => {
+  it('键数到达上限后淘汰最旧的键，内存不会无限增长', () => {
+    const total = 10_050;
+    for (let i = 0; i < total; i += 1) checkRateLimit(`cap-test-${i}`);
+    // 最早的键已被淘汰，所以它重新计数时仍然放行
+    expect(checkRateLimit('cap-test-0')).toBe(true);
+    for (let i = 0; i < total; i += 1) clearRateLimit(`cap-test-${i}`);
   });
 });
