@@ -1,11 +1,10 @@
 services:
   libretv:
     build: .
-    # 版本管理：镜像 tag 与 package.json 的 version 保持一致
-    # - 使用者：不设置 LIBRETV_IMAGE 即拉取 ghcr.io/librespark/libretv:latest（首次部署用 docker compose pull）
-    # - 开发者：docker compose up -d --build 会在本地构建并打上同名 tag
-    # - 需要固定版本时设置 LIBRETV_IMAGE=ghcr.io/librespark/libretv:2.0.1
-    image: ${LIBRETV_IMAGE:-ghcr.io/librespark/libretv:latest}
+    # 本分支默认源码构建：上游 ghcr.io/librespark/libretv 镜像不含排行榜、播放改进与限流修复。
+    # - 默认：docker compose up -d --build 在本地构建并打上 libretv:local
+    # - 想跑上游版本：设置 LIBRETV_IMAGE=ghcr.io/librespark/libretv:2.0.1，再 docker compose pull
+    image: ${LIBRETV_IMAGE:-libretv:local}
     container_name: libretv
     restart: unless-stopped
     ports:
@@ -16,6 +15,9 @@ services:
       - PASSWORD=${PASSWORD:?请在 .env 中设置 PASSWORD}
       # 可选：会话/代理签名密钥（多实例部署建议显式设置：openssl rand -hex 32）
       # - PROXY_SECRET=your-secret
+      # 可选：仅部署在反向代理后面时设为 true（登录限流按 X-Forwarded-For 计数；
+      # 要求代理覆盖而不是追加该头；直连部署保持关闭）
+      # - TRUST_PROXY=true
       # 可选：Cookie Secure 策略覆盖（true=强制开启 / false=强制关闭；不设置时按请求协议自动推导，HTTP 部署无需配置）
       # - COOKIE_SECURE=true
       # 可选：预置采集站（JSON 数组），用户端自动出现且默认勾选

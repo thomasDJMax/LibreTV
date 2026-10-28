@@ -81,11 +81,36 @@ export function sessionFromCookieHeader(cookieHeader: string | null): boolean {
 const attemptMap = new Map<string, { count: number; resetAt: number }>();
 const MAX_ATTEMPTS = 10;
 const WINDOW_MS = 10 * 60 * 1000;
+// 硬上限：即便攻击者在清理间隔内换着键刷，内存也不会无限涨。
+const MAX_TRACKED_KEYS = 10_000;
+
+/**
+ * 限流用的客户端标识。
+ *
+ * 转发头（X-Forwarded-For / X-Real-IP）由客户端完全可控：直连暴露时伪造它
+ * 就能每次换一个桶，把 10 次/10 分钟的限流绕成无限次。所以只有显式声明
+ * 「我在反向代理后面」时才信任这些头，并且要求代理**覆盖**（而不是追加）
+ * 该头。否则所有请求共用一个桶——更严，但伪造无效。
+ */
+export function rateLimitKeyFromRequest(req: Request): string {
+  if (process.env.TRUST_PROXY === 'true') {
+    const forwarded = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim();
+    if (forwarded) return forwarded;
+    const realIp = req.headers.get('x-real-ip')?.trim();
+    if (realIp) return realIp;
+  }
+  return 'direct';
+}
 
 export function checkRateLimit(ip: string): boolean {
   const now = Date.now();
   const entry = attemptMap.get(ip);
   if (!entry || now > entry.resetAt) {
+    if (!entry && attemptMap.size >= MAX_TRACKED_KEYS) {
+      // Map 保留插入顺序，淘汰最早的键即可腾出空间。
+      const oldest = attemptMap.keys().next();
+      if (!oldest.done) attemptMap.delete(oldest.value);
+    }
     attemptMap.set(ip, { count: 1, resetAt: now + WINDOW_MS });
     return true;
   }

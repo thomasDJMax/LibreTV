@@ -35,19 +35,19 @@ LibreTV Next.js 迁移版：免费在线视频聚合搜索与观看平台。基�
 # 在 .env 中设置 PASSWORD
 echo "PASSWORD=your-password" > .env
 
-# 方式一：拉取发布镜像（零构建）
-docker compose pull && docker compose up -d
-
-# 方式二：源码构建
+# 构建并启动（本分支的代码会打进镜像）
 docker compose up -d --build
 ```
+
+> ⚠️ 本分支不要用 `docker compose pull`：默认拉到的是上游 `ghcr.io/librespark/libretv` 镜像，**不含本分支的排行榜、播放改进与登录限流修复**。
 
 ### Docker Compose
 
 ```yaml
 services:
   libretv:
-    image: ghcr.io/librespark/libretv:latest
+    build: .
+    image: libretv:local
     container_name: libretv
     restart: unless-stopped
     ports:
@@ -55,6 +55,7 @@ services:
     environment:
       - PASSWORD=change-me   # 必填：访问密码，务必修改
       # - PROXY_SECRET=your-secret          # 会话/代理签名密钥，多实例部署建议设置
+      # - TRUST_PROXY=true                  # 仅部署在反向代理后面时设置，详见下方环境变量表
       # - DEFAULT_SOURCES=[{"name":"示例源","url":"https://example.com/api.php/provide/vod"}]
       # - DEFAULT_LIVE_SOURCES=[{"name":"示例直播源","url":"https://example.com/list.m3u"}]
       # - DEFAULT_SUBSCRIPTIONS=["https://example.com/sources.json"]  # 预置订阅，自动导入点播源+直播源
@@ -65,15 +66,16 @@ services:
 > 其余可选变量见下方[环境变量](#环境变量)表；仓库内的 `docker-compose.yml` 含完整注释版本（含 `build: .` 源码构建分支）。
 
 ```bash
-docker compose pull && docker compose up -d
+docker compose up -d --build
 ```
 
 > ⚠️ **生产部署必须通过 HTTPS 访问**（localhost 除外）：生产模式下会话 cookie 带 `Secure` 标记，浏览器只在 HTTPS（或 localhost）下保存它。因此用 `http://服务器IP:端口` 访问时，会出现"密码正确却无法登录"的现象——登录请求实际成功，但 cookie 被浏览器丢弃。请通过反向代理（Nginx / Caddy / Traefik）或 Cloudflare 等为站点套上 TLS 后再对外提供服务；本地开发用 `localhost` 不受影响。
 
-镜像发布在 GHCR 与 Docker Hub：`ghcr.io/librespark/libretv` 与 `docker.io/bestzwei/libretv`
-（`latest` / `主.次` / 完整版本号三个 tag，`linux/amd64` 与 `linux/arm64` 双架构，
-两个 registry 的镜像 digest 一致）。需要固定版本时在 `.env` 中设置
-`LIBRETV_IMAGE=ghcr.io/librespark/libretv:2.0.1`。
+上游镜像发布在 GHCR 与 Docker Hub：`ghcr.io/librespark/libretv` 与 `docker.io/bestzwei/libretv`
+（`latest` / `主.次` / 完整版本号三个 tag，`linux/amd64` 与 `linux/arm64` 双架构）。这两个镜像是
+**上游项目**的发布物，不包含本分支改动；本分支目前没有预构建镜像，请按上面的源码构建。
+确实想跑上游版本时，可在 `.env` 中设置 `LIBRETV_IMAGE=ghcr.io/librespark/libretv:2.0.1`
+覆盖 `docker-compose.yml` 的默认值，再执行 `docker compose pull`。
 
 > 版本号以 `package.json` 为单一来源，部署后可用 `/api/status` 返回的 `version` 字段核对。详见[部署文档](https://libretv.is-an.org/wiki/Deployment.html)。
 
@@ -91,6 +93,7 @@ PASSWORD=your-password npm start   # 监听 8080
 | --- | --- | --- |
 | `PASSWORD` | 是 | 访问密码；未设置时站点会提示管理员配置 |
 | `PROXY_SECRET` | 否 | 会话/代理签名密钥；不设置时从 PASSWORD 派生（多实例部署建议显式设置） |
+| `TRUST_PROXY` | 否 | 只有部署在反向代理后面时才设为 `true`：登录限流才会按 `X-Forwarded-For` 第一段 / `X-Real-IP` 计数，且要求代理**覆盖**而不是追加这两个头。直连部署保持默认，所有登录尝试共用一个 `direct` 限流桶，伪造转发头无法换桶绕过 |
 | `DEFAULT_SOURCES` | 否 | 预置采集站（JSON 数组），用户端自动出现且默认勾选，详见[配置文档](https://libretv.is-an.org/wiki/Configuration.html) |
 | `REQUEST_TIMEOUT` | 否 | 代理上游请求超时（毫秒），默认 8000 |
 | `MAX_RETRIES` | 否 | 代理请求重试次数，默认 1 |
@@ -216,12 +219,12 @@ npm version patch       # 或 minor / major；会更新 package.json 并打 git 
 git push && git push --tags
 ```
 
-CI 校验通过后自动构建并推送 `ghcr.io/librespark/libretv:<版本>`（详见[部署文档](https://libretv.is-an.org/wiki/Deployment.html)）。
+CI 校验通过后自动构建并推送 `ghcr.io/<owner>/<repo>:<版本>`（本仓库即 `ghcr.io/thomasdjmax/libretv`；fork 后仍需自己打 tag 才会发布）。
 
 ## 安全说明
 
 - 密码只保存在服务端环境变量中，前端不持有任何可重放凭证。
-- 登录接口有 IP 速率限制（10 次 / 10 分钟）。
+- 登录接口有速率限制（10 次 / 10 分钟）。直连部署（未设 `TRUST_PROXY`）时所有尝试共用 `direct` 桶，转发头无法伪造换桶；代价是恶意失败会暂时锁住全站登录，反代部署请设 `TRUST_PROXY=true` 并让代理覆盖转发头。
 - 代理内置 SSRF 防护：拒绝内网/保留地址（含 DNS 解析后校验），仅放行 http(s)。
 - 未登录会话仅允许代理图片类目标（豆瓣封面防盗链需要）。
 
