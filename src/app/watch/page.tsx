@@ -17,6 +17,7 @@ const PlayerShell = dynamic(() => import('@/components/player-shell').then((m) =
 });
 import { EmptyState, LoadingState, Spinner } from '@/components/states';
 import { SwitchSourceModal } from '@/components/switch-source';
+import { QualityBoost } from '@/components/quality-boost';
 import { enqueueDownload } from '@/components/download-manager';
 import { Icon } from '@/components/icon';
 import { useAuth } from '@/components/auth';
@@ -244,10 +245,19 @@ function WatchContent() {
                   episodeKey={sourceKey && vodId ? `${sourceKey}:${vodId}:${currentIndex}` : undefined}
                   nextUrl={hasNextEpisode ? episodes[currentIndex + 1] : undefined}
                   nextEpisodeKey={hasNextEpisode && sourceKey && vodId ? `${sourceKey}:${vodId}:${currentIndex + 1}` : undefined}
+                  onNextEpisode={hasNextEpisode ? () => goEpisode(currentIndex + 1) : undefined}
                   getRestorePosition={getRestorePosition}
                   onTimeUpdate={handleProgress}
                   onPause={handleProgress}
                   onEnded={handleEnded}
+                  introKey={sourceKey && vodId ? `${sourceKey}:${vodId}` : undefined}
+                  danmaku={{
+                    title: videoTitle,
+                    episodeLabel: currentEntryLabel,
+                    episodeIndex: currentIndex,
+                    isMovie: movieVersions,
+                    year: detailQuery.data?.videoInfo?.year,
+                  }}
                 />
               ) : (
                 <div className="aspect-video w-full flex items-center justify-center">
@@ -261,6 +271,19 @@ function WatchContent() {
                 </div>
               )}
             </div>
+
+            <QualityBoost
+              title={videoTitle}
+              year={detailQuery.data?.videoInfo?.year}
+              typeName={detailQuery.data?.videoInfo?.typeName}
+              sourceKey={sourceKey}
+              vodId={vodId}
+              index={currentIndex}
+              episodeLabel={currentEntryLabel}
+              episodeCount={episodes.length}
+              currentUrl={currentUrl}
+              movieVersions={movieVersions}
+            />
 
             {/* 操作栏 */}
             <div className="flex flex-wrap items-center gap-2 mt-3">

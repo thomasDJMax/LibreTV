@@ -2,10 +2,22 @@
 
 import { useEffect, useRef, useState } from 'react';
 import Artplayer from 'artplayer';
+import artplayerPluginDanmuku from 'artplayer-plugin-danmuku';
 import Hls, { type HlsConfig } from 'hls.js';
 
 import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
 import { createHlsLoader } from '@/lib/hls-loader';
+import { fetchDanmaku, type DanmakuTarget } from '@/lib/danmaku';
+import {
+  DEFAULT_INTRO_AUTO,
+  INTRO_AUTO_NO_INTRO,
+  introSeriesKey,
+  readIntroAutoCache,
+  readIntroAutoPreference,
+  requestIntroDetection,
+  writeIntroAutoCache,
+  writeIntroAutoPreference,
+} from '@/lib/intro-skip';
 import {
   getVideoPrefetcher,
   getNextEpisodePrefetcher,
@@ -53,6 +65,8 @@ interface PlayerShellProps {
   /** 下一集 m3u8 地址：当前集预取完成后预热下一集前 7 分钟 */
   nextUrl?: string;
   nextEpisodeKey?: string;
+  /** 控制栏「下一集」快捷按钮的落点：由播放页导航到下一集；缺省时按钮不出现 */
+  onNextEpisode?: () => void;
   /** 进度恢复：优先 URL position，其次查询该回调（返回 0 表示无记录） */
   getRestorePosition?: () => number | Promise<number>;
   onTimeUpdate?: (position: number, duration: number) => void;
@@ -60,6 +74,10 @@ interface PlayerShellProps {
   onPause?: (position: number, duration: number) => void;
   /** 恢复策略判源不可用（重试耗尽/格式硬失败）时回调：父级弹出换源面板 */
   onRequestSwitchSource?: (reason: string) => void;
+  /** 弹幕目标：标题 + 当前集，服务端据此匹配弹幕（未配置弹幕服务时无弹幕） */
+  danmaku?: DanmakuTarget;
+  /** 剧集标识（`源key:vodId`）：智能识别片头按此缓存，同一部剧各集共用结果 */
+  introKey?: string;
 }
 
 interface QualityControlsState {
@@ -95,13 +113,18 @@ export function PlayerShell({
   episodeKey,
   nextUrl,
   nextEpisodeKey,
+  onNextEpisode,
   getRestorePosition,
   onTimeUpdate,
   onEnded,
   onPause,
   onRequestSwitchSource,
+  danmaku,
+  introKey,
 }: PlayerShellProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // 控制栏「下一集」按钮的 DOM：换集时只更新显示状态，不重建播放器
+  const nextControlRef = useRef<HTMLElement | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const artRef = useRef<any>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -117,6 +140,9 @@ export function PlayerShell({
   const [introPreferences, setIntroPreferences] = useState(DEFAULT_INTRO_SKIP);
   const [customIntroSeconds, setCustomIntroSeconds] = useState(false);
   const introPreferencesRef = useRef(DEFAULT_INTRO_SKIP);
+  // 智能识别片头：按视频内容定位正片开始，识别不出时回退到上面的固定秒数
+  const [autoIntro, setAutoIntro] = useState(DEFAULT_INTRO_AUTO.enabled);
+  const autoIntroRef = useRef(DEFAULT_INTRO_AUTO.enabled);
   const [outroPreferences, setOutroPreferences] = useState(DEFAULT_OUTRO_SKIP);
   const [customOutroSeconds, setCustomOutroSeconds] = useState(false);
   const outroPreferencesRef = useRef(DEFAULT_OUTRO_SKIP);
@@ -134,12 +160,12 @@ export function PlayerShell({
 
   // 始终持有最新 props/回调，避免重建播放器
   const propsRef = useRef({
-    url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
-    getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource,
+    url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey, onNextEpisode,
+    getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource, danmaku, introKey,
   });
   propsRef.current = {
-    url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
-    getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource,
+    url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey, onNextEpisode,
+    getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource, danmaku, introKey,
   };
 
   // 跨集共享、每次换集重置的播放链路状态
@@ -151,6 +177,10 @@ export function PlayerShell({
   const videoErrorRetryUsedRef = useRef(false);
   // 进度恢复每集只执行一次（MANIFEST_PARSED 可能因代理回退再次触发）
   const restoredRef = useRef(false);
+  // 智能识别片头：用户是否已手动拖动进度（拖过就不再自动拽位置）、当前 seek 是否由自动跳片头触发
+  const userSeekedRef = useRef(false);
+  const autoSeekRef = useRef(false);
+  const introDetectAbortRef = useRef<AbortController | null>(null);
   // timeupdate 续跑预取的游标：必须按集清零，否则会沿用上一集的时间戳推迟首次续跑
   const lastPrefetchEnsureRef = useRef(0);
   // setupHls 可能改走代理形式，video:error 重试要用最近一次的地址
@@ -216,9 +246,13 @@ export function PlayerShell({
   const skipIntroNow = () => {
     const video = artRef.current?.video as HTMLVideoElement | undefined;
     if (!video) return;
+    // 智能识别已出结果时，手动「跳过片头」也直接用识别值
+    const autoStart = autoIntroRef.current ? autoIntroPreferencesFor() : null;
     const target = resolveStartPosition({
       duration: video.duration,
-      preferences: { ...introPreferencesRef.current, enabled: true },
+      preferences: autoStart && autoStart.seconds > 0
+        ? autoStart
+        : { ...introPreferencesRef.current, enabled: true },
     });
     if (target === null) { showHint('正在读取视频时长，请稍后重试'); return; }
     if (target <= 0) { showHint('设定时长为零或视频较短，已保留片尾'); return; }
@@ -250,7 +284,9 @@ export function PlayerShell({
       manifestLoadingMaxRetry: 3,
       manifestLoadingRetryDelay: 1000,
       startLevel: -1,
-      abrEwmaDefaultEstimate: 500_000,
+      // 起播默认按较高码率估算带宽：多码率源先上高画质档位，
+      // 带宽不足时 hls.js 的 ABR 会在随后几个分片内自动降档。
+      abrEwmaDefaultEstimate: 2_000_000,
       appendErrorMaxRetry: 5,
       // 组合 loader：广告过滤（blockAd 随设置）+ 片段缓存命中（cacheEnabled）
       loader: createHlsLoader(Hls, { blockAd: p.adFilter }) as unknown as HlsConfig['loader'],
@@ -457,6 +493,88 @@ export function PlayerShell({
     showHint(index === -1 ? '已恢复自动选择画质' : '已选择版本，后续片段将切换');
   };
 
+  /** 换集后让弹幕插件按新集数重新拉一次（plugin.load 会清空上一集的弹幕队列）。 */
+  const reloadDanmaku = () => {
+    const plugin = artRef.current?.plugins?.artplayerPluginDanmuku;
+    if (!plugin) return;
+    try {
+      plugin.config({ danmuku: () => fetchDanmaku(propsRef.current.danmaku) });
+      plugin.load();
+    } catch {
+      /* 弹幕插件异常不能影响正片播放 */
+    }
+  };
+
+  /**
+   * 本剧集的智能片头偏好：已识别则用识别值；还没识别出结果时先不跳（seconds: 0），
+   * 等识别返回后再自动跳到正片——避免首次识别（约 10~40 秒）前先按固定秒数切掉正片。
+   */
+  const autoIntroPreferencesFor = (): IntroSkipPreferences => {
+    const p = propsRef.current;
+    const cached = readIntroAutoCache(introSeriesKey(p.introKey, p.title));
+    if (cached === null || cached <= 0) return { enabled: true, seconds: 0 };
+    return { enabled: true, seconds: cached };
+  };
+
+  /**
+   * 请求服务端识别片头，出结果后（在用户没自己拖过进度、且还没播过识别点的情况下）
+   * 自动跳到正片开始。识别失败/超时回退到固定秒数；都不打扰播放。
+   */
+  const startIntroDetection = () => {
+    const p = propsRef.current;
+    if (!autoIntroRef.current || !p.url) return;
+    const seriesKey = introSeriesKey(p.introKey, p.title);
+    if (readIntroAutoCache(seriesKey) !== null) return;
+    introDetectAbortRef.current?.abort();
+    const controller = new AbortController();
+    introDetectAbortRef.current = controller;
+
+    // 统一跳转：元数据没就绪时轮询等待（最多约 20 秒），用户自己拖过进度就不再动。
+    const applySkip = (seconds: number, tries = 0) => {
+      const video = artRef.current?.video as HTMLVideoElement | undefined;
+      if (!video || controller.signal.aborted || endedRef.current || userSeekedRef.current) return;
+      if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+        if (tries < 100) setTimeout(() => applySkip(seconds, tries + 1), 200);
+        return;
+      }
+      if (!Number.isFinite(video.duration) || video.duration <= seconds + 10) return;
+      if (video.currentTime >= seconds - 1.5) return;
+      autoSeekRef.current = true;
+      restoredRef.current = true;
+      try {
+        video.currentTime = seconds;
+      } catch {
+        autoSeekRef.current = false;
+        return;
+      }
+      ensurePrefetch(currentMediaUrlRef.current, seconds);
+      showHint(`已自动跳过片头 ${formatTime(seconds)}`);
+    };
+
+    void requestIntroDetection({ title: p.title, key: seriesKey, url: p.url, signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        // 识别服务不可用（未配置/超时/源不支持）：回退到用户设定的固定秒数。
+        if (!result?.ok) {
+          const fixed = introPreferencesRef.current;
+          if (fixed.enabled && fixed.seconds > 0) applySkip(fixed.seconds);
+          return;
+        }
+        const detected = typeof result.skipTo === 'number' && result.skipTo > 0 ? result.skipTo : 0;
+        // 同一部剧只识别一次：没片头的也记成 -1，避免每集都重新分析。
+        writeIntroAutoCache(seriesKey, detected > 0 ? detected : INTRO_AUTO_NO_INTRO);
+        if (detected > 0) applySkip(detected);
+      })
+      .catch(() => { /* 识别失败不影响播放 */ });
+  };
+
+  const updateAutoIntro = (enabled: boolean) => {
+    autoIntroRef.current = enabled;
+    setAutoIntro(enabled);
+    writeIntroAutoPreference({ enabled });
+    if (enabled) startIntroDetection();
+  };
+
   /** 换集：重置每集状态并切换到新 HLS 源（不重建 ArtPlayer）。 */
   const loadEpisode = (targetUrl: string, resetStart = true) => {
     if (!targetUrl) return;
@@ -466,7 +584,10 @@ export function PlayerShell({
     videoErrorRetryUsedRef.current = false;
     if (resetStart) {
       restoredRef.current = false;
-      episodeStartRef.current = { preferences: { ...introPreferencesRef.current }, saved: 0, ready: false };
+      userSeekedRef.current = false;
+      autoSeekRef.current = false;
+      const autoStart = autoIntroRef.current ? autoIntroPreferencesFor() : null;
+      episodeStartRef.current = { preferences: autoStart ?? { ...introPreferencesRef.current }, saved: 0, ready: false };
       endedRef.current = false;
     }
     lastPrefetchEnsureRef.current = 0;
@@ -478,6 +599,8 @@ export function PlayerShell({
     const art = artRef.current;
     if (!art) return;
     setupHls(art.video, targetUrl, true);
+    reloadDanmaku();
+    startIntroDetection();
   };
 
   // —— 创建播放器（仅一次，挂载即创建） ——
@@ -488,7 +611,11 @@ export function PlayerShell({
     try { storedPreferences = normalizeIntroSkipPreferences(JSON.parse(localStorage.getItem(INTRO_SKIP_KEY) ?? 'null')); } catch { /* Use defaults. */ }
     introPreferencesRef.current = storedPreferences;
     setIntroPreferences(storedPreferences);
-    episodeStartRef.current = { preferences: { ...storedPreferences }, saved: 0, ready: false };
+    const storedAuto = readIntroAutoPreference();
+    autoIntroRef.current = storedAuto.enabled;
+    setAutoIntro(storedAuto.enabled);
+    const autoStart = storedAuto.enabled ? autoIntroPreferencesFor() : null;
+    episodeStartRef.current = { preferences: autoStart ?? { ...storedPreferences }, saved: 0, ready: false };
     let storedOutro = DEFAULT_OUTRO_SKIP;
     try { storedOutro = normalizeOutroSkipPreferences(JSON.parse(localStorage.getItem(OUTRO_SKIP_KEY) ?? 'null')); } catch { /* Use defaults. */ }
     outroPreferencesRef.current = storedOutro;
@@ -527,6 +654,22 @@ export function PlayerShell({
       theme: '#2563eb',
       lang: navigator.language.toLowerCase().startsWith('zh') ? 'zh-cn' : 'en',
       moreVideoAttr: { crossOrigin: 'anonymous', playsInline: true },
+      plugins: [
+        // 弹幕插件：数据由 /api/danmaku 服务端匹配（本地自建 danmu_api 聚合多平台）。
+        // emitter 关闭：当前只做「看弹幕」，不做发送（无自建发送通道）。
+        artplayerPluginDanmuku({
+          danmuku: () => fetchDanmaku(propsRef.current.danmaku),
+          speed: 5,
+          margin: [10, '20%'],
+          opacity: 0.9,
+          fontSize: 25,
+          antiOverlap: true,
+          synchronousPlayback: true,
+          heatmap: false,
+          emitter: false,
+          visible: true,
+        }),
+      ],
       customType: {
         m3u8: (video: HTMLVideoElement, mediaUrl: string) => {
           setupHls(video, mediaUrl, true);
@@ -534,6 +677,34 @@ export function PlayerShell({
       },
     });
     artRef.current = art;
+    // 起播后异步识别片头（已识别过同一部剧则直接命中本地缓存，不重复请求）
+    startIntroDetection();
+    // 控制栏「下一集」快捷键：插在播放/暂停键（index 10）之后、音量之前（index 11）。
+    // 页面下方操作栏已有「下一集」，但得滚出画面才能点到；追剧时控制栏就在手边。
+    art.controls.add({
+      name: 'nextEpisode',
+      position: 'left',
+      index: 11,
+      html:
+        '<span class="art-next-episode">' +
+        '<svg class="art-icon" viewBox="0 0 24 24" aria-hidden="true">' +
+        '<path d="M4.5 5.6c0-.8.9-1.3 1.6-.9l9.4 6.1c.6.4.6 1.3 0 1.7l-9.4 6.1c-.7.4-1.6-.1-1.6-.9V5.6Z" fill="currentColor"/>' +
+        '<rect x="17.4" y="5.2" width="2.2" height="13.6" rx="1.1" fill="currentColor"/>' +
+        '</svg>' +
+        '<span class="art-next-episode-label">下一集</span>' +
+        '</span>',
+      // 用 ref 取最新回调：播放器只创建一次，换集后旧闭包里的索引会过期
+      click: () => {
+        propsRef.current.onNextEpisode?.();
+      },
+      mounted: (element: HTMLElement) => {
+        nextControlRef.current = element;
+        element.setAttribute('aria-label', '播放下一集');
+      },
+      beforeUnmount: () => {
+        nextControlRef.current = null;
+      },
+    });
     const updateActualDimensions = () => {
       // Manifest dimensions are only declarations. Use the decoded video element
       // for this field, including resize events during an adaptive level switch.
@@ -621,6 +792,12 @@ export function PlayerShell({
     });
     art.on('video:seeked', () => {
       if (endedRef.current) return;
+      if (autoSeekRef.current) {
+        autoSeekRef.current = false;
+      } else {
+        // 用户自己拖动过进度：之后识别结果返回时不要再把播放点往后拽。
+        userSeekedRef.current = true;
+      }
       ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
     });
     art.on('video:pause', () => {
@@ -733,6 +910,7 @@ export function PlayerShell({
       }
       document.removeEventListener('keydown', shortcuts);
       document.removeEventListener('visibilitychange', saveOnHide);
+      introDetectAbortRef.current?.abort();
       if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
       el?.removeEventListener('touchstart', onTouchStart);
       el?.removeEventListener('touchend', onTouchEnd);
@@ -773,6 +951,14 @@ export function PlayerShell({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adFilter]);
+
+  // —— 「下一集」按钮的显隐：只有确实存在下一集且播放页给了导航回调时才出现 ——
+  // 电影多版本、单集直链、最后一集都会隐藏，避免点了没反应
+  useEffect(() => {
+    const control = nextControlRef.current;
+    if (!control) return;
+    control.style.display = nextUrl && onNextEpisode ? '' : 'none';
+  }, [nextUrl, onNextEpisode]);
 
   const activeOption = quality.options.find((option) => option.levelIndexes.includes(quality.active));
 
@@ -847,6 +1033,17 @@ export function PlayerShell({
           <p className="mt-1.5 text-faint">当前视频仅提供一个清晰度档位，想更清晰可切换资源。</p>
         ) : null}
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-line pt-2">
+          <label
+            className="flex items-center gap-1.5 cursor-pointer"
+            title="按视频内容识别片头结束点（服务端分析开头约 3 分钟），识别不出时不跳；首次识别约 10~30 秒。"
+          >
+            <input
+              type="checkbox"
+              checked={autoIntro}
+              onChange={(event) => updateAutoIntro(event.target.checked)}
+            />
+            智能识别片头
+          </label>
           <label className="flex items-center gap-1.5 cursor-pointer" title="按设定秒数跳过，不自动识别广告；修改设置从下次播放或下一集生效。">
             <input
               type="checkbox"
@@ -887,10 +1084,12 @@ export function PlayerShell({
               </>
             ) : null}
           </label>
-          <button className="btn-ghost text-xs px-2 py-1" onClick={skipIntroNow} disabled={introPreferences.seconds === 0}>
+          <button className="btn-ghost text-xs px-2 py-1" onClick={skipIntroNow} disabled={!autoIntro && introPreferences.seconds === 0}>
             跳过片头
           </button>
-          <span className="text-faint">按设定秒数跳过 · 设置下次生效</span>
+          <span className="text-faint">
+            {autoIntro ? '识别到片头会自动跳到正片（识别不出时按设定秒数）' : '按设定秒数跳过 · 设置下次生效'}
+          </span>
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2">
           <label className="flex items-center gap-1.5 cursor-pointer" title="进入设定的片尾区间后直接播放下一集，需要开启自动连播；短视频会保留至少30秒正片。">

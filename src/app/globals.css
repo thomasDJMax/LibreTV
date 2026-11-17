@@ -156,6 +156,49 @@ body {
   50% { opacity: 0.55; box-shadow: 0 0 0 4px rgba(239, 68, 68, 0); }
 }
 
+/* —— 播放器控制栏「下一集」按钮（紧挨暂停键） —— */
+/* 胶囊自撑宽度：.art-control 默认按 46px 图标位留最小宽度，会把按钮撑成一大块 */
+.art-video-player .art-controls .art-control.art-control-nextEpisode {
+  min-width: 0;
+  padding: 0 2px;
+  /* 内建控件是 --art-control-opacity(0.75) 半透明图标；主题蓝被一起压暗会显得发灰，
+     按钮要维持实心可点的观感，故用一档更高特异性（0,4,0 > 内建 0,3,0）覆盖 */
+  opacity: 1;
+}
+.art-next-episode {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px 0 8px;
+  border-radius: 999px;
+  background-color: var(--art-theme);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+.art-video-player .art-controls .art-control-nextEpisode:hover .art-next-episode {
+  filter: brightness(1.12);
+}
+/* 内建 .art-control .art-icon 是 36px（特异性 0,4,0），压过它才能塞进胶囊 */
+.art-video-player .art-controls .art-control-nextEpisode .art-next-episode .art-icon {
+  width: 16px;
+  height: 16px;
+  transform: none;
+}
+/* 窄屏只留图标，别挤占进度条右侧的空间 */
+@media (max-width: 560px) {
+  .art-next-episode {
+    gap: 0;
+    padding: 0 8px;
+  }
+  .art-next-episode .art-next-episode-label {
+    display: none;
+  }
+}
+
 /* 只收敛本站装饰动效，不干预播放器及抽屉的挂载/卸载生命周期。 */
 @media (prefers-reduced-motion: reduce) {
   .card,
