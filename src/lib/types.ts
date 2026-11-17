@@ -100,6 +100,11 @@ export interface DoubanResponse {
   items: DoubanItem[];
 }
 
+/** /api/hot-list 响应：items 之外带榜单数据的抓取时间（毫秒时间戳，前端展示「更新于」） */
+export interface HotListResponse extends DoubanResponse {
+  updatedAt?: number;
+}
+
 export interface BangumiCalendarDay {
   /** 1=周一 … 7=周日 */
   weekday: number;

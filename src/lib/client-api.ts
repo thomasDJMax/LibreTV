@@ -1,7 +1,7 @@
 'use client';
 
 import type { AnimeCatalogQuery, AnimeCatalogResponse } from './anime-catalog-types';
-import type { SearchResponse, SearchStreamEvent, SourceSearchOutcome, VideoDetail, VodQualityResult, DoubanResponse, BangumiCalendarResponse, AuthStatusResponse, SourceConfig, SearchResultItem, LivePlaylistResponse, LiveEpgResponse, SourceListPayload } from './types';
+import type { SearchResponse, SearchStreamEvent, SourceSearchOutcome, VideoDetail, VodQualityResult, DoubanResponse, HotListResponse, BangumiCalendarResponse, AuthStatusResponse, SourceConfig, SearchResultItem, LivePlaylistResponse, LiveEpgResponse, SourceListPayload } from './types';
 
 /**
  * 客户端 API 封装。401 时触发全局事件打开登录框，
@@ -160,10 +160,11 @@ export const api = {
     return request<AnimeCatalogResponse>(`/api/anime?${sp}`, { signal });
   },
 
-  /** 豆瓣周榜、韩剧口碑榜与百度热播剧。 */
-  hotList: (id: string, signal?: AbortSignal) => {
+  /** 豆瓣周榜、韩剧口碑榜与百度热播剧；force=true 跳过服务端新鲜缓存强制刷新。 */
+  hotList: (id: string, signal?: AbortSignal, force = false) => {
     const sp = new URLSearchParams({ id });
-    return request<DoubanResponse>(`/api/hot-list?${sp.toString()}`, { signal });
+    if (force) sp.set('force', '1');
+    return request<HotListResponse>(`/api/hot-list?${sp.toString()}`, { signal });
   },
 
   /** 换源：按标题跨源搜索并取详情，附带接口耗时（测速）；支持 signal 以便关闭弹窗时中止在途请求 */

@@ -120,17 +120,33 @@ export async function fetchUpstreamJson<T = unknown>(url: string, options: Fetch
   return data;
 }
 
-/** 内存 TTL 缓存（豆瓣推荐等热点数据） */
-const cache = new Map<string, { value: unknown; expiresAt: number }>();
+/** 内存 TTL 缓存（豆瓣推荐、榜单等热点数据） */
+interface CacheEntry {
+  value: unknown;
+  /** 写入时间：前端的「更新于」直接用它，避免把旧的过期数据当新数据展示 */
+  createdAt: number;
+  expiresAt: number;
+}
+const cache = new Map<string, CacheEntry>();
+
+/**
+ * 读取缓存条目（含已过期条目）：给「上游失败时先用旧数据顶上」的降级路径用。
+ * 普通读取请用 getCache，它会顺手清掉过期条目。
+ */
+export function getCacheEntry<T>(key: string): { value: T; createdAt: number; expiresAt: number } | undefined {
+  const entry = cache.get(key);
+  if (!entry) return undefined;
+  return { value: entry.value as T, createdAt: entry.createdAt, expiresAt: entry.expiresAt };
+}
 
 export function getCache<T>(key: string): T | undefined {
-  const entry = cache.get(key);
+  const entry = getCacheEntry<T>(key);
   if (!entry) return undefined;
   if (Date.now() > entry.expiresAt) {
     cache.delete(key);
     return undefined;
   }
-  return entry.value as T;
+  return entry.value;
 }
 
 export function setCache(key: string, value: unknown, ttlMs: number): void {
@@ -142,5 +158,6 @@ export function setCache(key: string, value: unknown, ttlMs: number): void {
     }
     if (cache.size > 500) cache.clear();
   }
-  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+  const now = Date.now();
+  cache.set(key, { value, createdAt: now, expiresAt: now + ttlMs });
 }

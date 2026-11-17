@@ -6,6 +6,7 @@ import { fetchUpstream, getCache, setCache } from './fetch-utils';
 vi.mock('./fetch-utils', () => ({
   fetchUpstream: vi.fn(),
   getCache: vi.fn(),
+  getCacheEntry: vi.fn(),
   setCache: vi.fn(),
 }));
 

@@ -1,8 +1,9 @@
 'use client';
 
-import { memo, useEffect, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/client-api';
+import { sortByRatingDesc } from '@/lib/ranking-sort';
 import { useAppStore } from '@/lib/store';
 import type { DoubanItem } from '@/lib/types';
 import { cn } from '@/lib/utils';
@@ -50,16 +51,40 @@ export function RankingSection({ onPick }: { onPick: (title: string) => void }) 
     try { localStorage.setItem(PREFERENCE_KEY, id); } catch { /* 忽略偏好保存失败。 */ }
   };
 
+  const queryClient = useQueryClient();
+  const [refreshing, setRefreshing] = useState(false);
+
   const query = useQuery({
     queryKey: ['hot-list', listId],
     queryFn: ({ signal }) => api.hotList(listId, signal),
     enabled: ready && listId !== 'anime',
-    staleTime: 10 * 60 * 1000,
-    refetchOnWindowFocus: false,
+    staleTime: 30 * 1000,
+    // 排行榜实时更新：页面可见时每 60 秒自动拉一次（服务端有缓存，成本很低）
+    refetchInterval: 60 * 1000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
     retry: 1,
   });
   const items = query.data?.items ?? [];
+  // 按评分从高到低展示；无评分的榜单（百度热播剧）保持原有次序
+  const sortedItems = useMemo(() => sortByRatingDesc(items), [items]);
+  const updatedAt = query.data?.updatedAt ?? (query.data ? query.dataUpdatedAt : undefined);
+  const updatedText = useMemo(
+    () => (updatedAt ? new Date(updatedAt).toLocaleTimeString('zh-CN', { hour12: false }) : ''),
+    [updatedAt]
+  );
   const loading = !ready || query.isLoading;
+
+  // 手动刷新：force=1 跳过服务端新鲜缓存，立刻向上游取一次
+  const manualRefresh = useCallback(async () => {
+    if (refreshing || query.isFetching) return;
+    setRefreshing(true);
+    try {
+      const data = await api.hotList(listId, undefined, true);
+      queryClient.setQueryData(['hot-list', listId], data);
+    } catch { /* 手动刷新失败时保留现有数据 */ }
+    finally { setRefreshing(false); }
+  }, [refreshing, query.isFetching, queryClient, listId]);
 
   return (
     <section aria-label="影视排行榜" className="pb-4">
@@ -100,9 +125,30 @@ export function RankingSection({ onPick }: { onPick: (title: string) => void }) 
             </button>
           ))}
         </div>
-        <p className="text-xs text-faint" aria-live="polite">
-          {board.source} · {board.title}{items.length > 0 ? ` · ${items.length} 部上榜` : ''}
-        </p>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+          <span className="inline-flex items-center gap-1.5 font-medium text-emerald-600 dark:text-emerald-400" title="每 60 秒自动刷新一次">
+            <span className="relative flex h-2 w-2" aria-hidden>
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-70" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+            </span>
+            实时更新
+          </span>
+          <span className="text-faint" aria-live="polite">
+            {board.source} · {board.title}{items.length > 0 ? ` · ${items.length} 部上榜` : ''}
+            {updatedText ? ` · 更新于 ${updatedText}` : ''}
+          </span>
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-faint transition-colors hover:bg-hover hover:text-content disabled:opacity-60"
+            title="立即刷新（跳过服务端缓存）"
+            aria-label="立即刷新排行榜"
+            disabled={refreshing || query.isFetching}
+            onClick={() => void manualRefresh()}
+          >
+            <Icon name="refresh" className={cn('h-3.5 w-3.5', (refreshing || query.isFetching) && 'animate-spin')} />
+            {refreshing ? '刷新中…' : '刷新'}
+          </button>
+        </div>
       </div>
 
       {loading ? <RankingSkeleton /> : query.isError && !items.length ? (
@@ -116,14 +162,18 @@ export function RankingSection({ onPick }: { onPick: (title: string) => void }) 
         <p className="py-10 text-center text-sm text-muted" role="status">这个榜单暂时没有内容，换个分类看看。</p>
       ) : (
         <ol aria-label={board.title} className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
-          {items.map((item, index) => (
-            <RankingEntry key={`${listId}:${item.id}`} item={item} rank={item.rank ?? index + 1} rated={board.source === '豆瓣'} onPick={onPick} />
+          {sortedItems.map((item, index) => (
+            <RankingEntry key={`${listId}:${item.id}`} item={item} rank={index + 1} rated={board.source === '豆瓣'} onPick={onPick} />
           ))}
         </ol>
       )}
 
       <p className="mt-4 text-xs leading-relaxed text-faint">
-        {listId === 'douban_tv_korean' ? '豆瓣韩剧口碑条目与韩国电视剧目录交叉筛选，按口碑条目顺序排列。' : board.source === '豆瓣' ? '按豆瓣原榜名次排列，评分仅供参考。' : '按百度热播剧榜名次排列。'}榜单推荐不代表已找到可播放片源。
+        {listId === 'douban_tv_korean'
+          ? '豆瓣韩剧口碑条目与韩国电视剧目录交叉筛选，按评分从高到低排列。'
+          : board.source === '豆瓣'
+            ? '按评分从高到低排列，同分保留原榜次序；每 60 秒自动刷新。'
+            : '百度热播剧榜按热度排列（榜单无评分），每 60 秒自动刷新。'}榜单推荐不代表已找到可播放片源。
       </p>
       </>}
     </section>

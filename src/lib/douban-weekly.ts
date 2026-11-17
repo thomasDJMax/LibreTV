@@ -1,5 +1,5 @@
 import type { DoubanItem } from './types';
-import { fetchUpstream, getCache, setCache } from './fetch-utils';
+import { fetchUpstream, getCacheEntry, setCache } from './fetch-utils';
 import { fetchKoreanDramaRanking } from './douban';
 
 /**
@@ -10,8 +10,18 @@ import { fetchKoreanDramaRanking } from './douban';
  * 数据中心出口 IP 常被限流，Vercel 上不可依赖）；可用 60S_API_BASE 指向自部署实例。
  */
 
-const CACHE_TTL = 60 * 60 * 1000;
+const DEFAULT_CACHE_TTL = 60 * 60 * 1000;
+/** HOT_LIST_CACHE_TTL_MS 的允许范围：过短会打爆 60s API 的限流，过长则失去「准实时」意义 */
+const MIN_CACHE_TTL = 30 * 1000;
+const MAX_CACHE_TTL = 6 * 60 * 60 * 1000;
 const UA = 'LibreTV (+https://github.com/LibreSpark/LibreTV)';
+
+/** 榜单缓存时长：默认 1 小时；部署者可用 HOT_LIST_CACHE_TTL_MS 缩短到 30 秒~6 小时。 */
+export function hotListCacheTtl(): number {
+  const raw = Number(process.env.HOT_LIST_CACHE_TTL_MS);
+  if (Number.isFinite(raw) && raw >= MIN_CACHE_TTL && raw <= MAX_CACHE_TTL) return Math.floor(raw);
+  return DEFAULT_CACHE_TTL;
+}
 
 const FALLBACK_BASE = 'https://60s.viki.moe';
 
@@ -125,11 +135,7 @@ async function fetchJson(path: string): Promise<unknown> {
   throw lastError instanceof Error ? lastError : new Error('60s API 请求失败');
 }
 
-export async function fetchHotList(id: HotListId): Promise<DoubanItem[]> {
-  const cacheKey = `hot-list:${id}`;
-  const cached = getCache<DoubanItem[]>(cacheKey);
-  if (cached) return cached;
-
+async function loadHotList(id: HotListId): Promise<DoubanItem[]> {
   let items: DoubanItem[];
 
   const category = DOUBAN_WEEKLY_CATEGORY[id];
@@ -149,7 +155,43 @@ export async function fetchHotList(id: HotListId): Promise<DoubanItem[]> {
   }
 
   if (items.length === 0) throw new Error('榜单数据为空');
-
-  setCache(cacheKey, items, CACHE_TTL);
   return items;
+}
+
+const inflight = new Map<HotListId, Promise<DoubanItem[]>>();
+
+/**
+ * 读取榜单：新鲜缓存直接返回；缓存过期（或 force）时请求上游。
+ * 同一榜单的并发请求共用一次上游调用；上游失败但还有旧数据时返回旧数据，
+ * 这样前端定时轮询与限流/网络抖动不会把整块榜单变成错误提示。
+ */
+export async function fetchHotList(id: HotListId, options: { force?: boolean } = {}): Promise<DoubanItem[]> {
+  const cacheKey = `hot-list:${id}`;
+  const cached = getCacheEntry<DoubanItem[]>(cacheKey);
+  if (cached && !options.force && Date.now() <= cached.expiresAt) return cached.value;
+
+  const running = inflight.get(id);
+  if (running) return running;
+
+  const task = (async () => {
+    try {
+      const items = await loadHotList(id);
+      setCache(cacheKey, items, hotListCacheTtl());
+      return items;
+    } catch (err) {
+      if (cached) return cached.value;
+      throw err;
+    }
+  })();
+  inflight.set(id, task);
+  try {
+    return await task;
+  } finally {
+    inflight.delete(id);
+  }
+}
+
+/** 榜单当前缓存数据的写入时间（前端「更新于」用）；从未成功拉取时为 undefined。 */
+export function getHotListUpdatedAt(id: HotListId): number | undefined {
+  return getCacheEntry<DoubanItem[]>(`hot-list:${id}`)?.createdAt;
 }
