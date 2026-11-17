@@ -36,9 +36,66 @@
 
 - 换源时比较当前集的码流信息，区分真实分辨率、码率估算和清单标注。结果用于选择片源，不会把低清内容变成高清，也不会移除片内水印。
 - 搜索与换源优先匹配片名、季度、集号和版本，保留不同语言及版本的区别，减少串季、串集。
-- 支持跳过片头，以及到片尾时间点后自动播放下一集；默认跳过时长为 90 秒，可在播放器中调整。按时长执行，不是自动识别片头、片尾画面。
+- 支持跳过片头，以及到片尾时间点后自动播放下一集；默认跳过时长为 90 秒，可在播放器中调整。新增「智能识别片头」开关（默认开启）：服务端用 ffmpeg 分析视频开头约 165 秒的黑场、镜头切换和静音，推断片头结束点并自动跳过去；识别失败或源不支持时回退到固定秒数，宁可不跳也不误切正片。
 - 电影的不同清晰度或语言版本不会作为连续剧集自动连播。
 - 减少滚动时的大面积滤镜和阴影动画，图片异步解码，复用卡片渲染，清理弹窗动画回调，支持系统减少动态效果设置。
+- 控制栏新增「下一集」快捷按钮（仅在有下一集时显示），移动端窄屏只显示图标。
+
+## 弹幕
+
+播放 HLS 点播时自动加载弹幕，由独立弹幕服务提供数据，默认只显示、不发送（`emitter: false`）。
+
+- 服务端 `/api/danmaku?title=&label=&index=&movie=1&year=`：按「片名 + 集数」匹配剧集（`POST /api/v2/match`），再取该集弹幕（`GET /api/v2/comment/{id}`），转成 ArtPlayer 弹幕插件格式；单集最多 8000 条，命中 10 分钟 / 未命中 5 分钟缓存。
+- 前端使用 [`artplayer-plugin-danmuku`](https://www.npmjs.com/package/artplayer-plugin-danmuku)，换集时自动重置弹幕队列并重新请求。
+- 弹幕数据来自自建 [danmu_api](https://github.com/huángxd-/danmu_api)（聚合多个平台）。未配置 `DANMU_API_BASE` 或服务不可用时，接口返回 `enabled: false`，播放不受影响。
+- 自建 danmu_api 的最简方式（Node ≥ 18）：
+
+  ```sh
+  git clone https://github.com/huangxd-/danmu_api.git
+  cd danmu_api
+  npm install
+  cp config/.env.example config/.env   # 默认 TOKEN=87654321、端口 9321
+  npm start                            # 默认 http://127.0.0.1:9321
+  ```
+
+  然后在 LibreTV 的 `.env` 里加 `DANMU_API_BASE=http://127.0.0.1:9321` 并重启服务。
+
+## 画质提升提示
+
+播放页会在后台比较其他片源的画质，发现明显更清晰的线路时给出一条提示（可一键切换、可忽略）。
+
+- 服务端 `POST /api/vod/quality`：解码首个分片 H.264 SPS，返回实测分辨率、码率、样本哈希；缓存 10 分钟。
+- 前端 `QualityBoost`：延迟 4 秒 → 测量当前线路 → 在已启用源里搜同名剧 → 匹配集数 → **并发 2** 测画质 → 按像素/码率排序；当前已是 1080p 高码率时不再打扰。
+- 判据：候选像素 ≥ 当前 1.1 倍或码率 ≥ 当前 1.4 倍；当前画质未知时要求候选 ≥1080p 或 ≥2500kbps；样本哈希相同视为同一线路，不提示。
+- 只是提示，不自动切换；切换沿用换源逻辑（同剧同集）。HLS 起播码率估算从 500kbps 提高到 2Mbps，多码率源会优先起播高码率，带宽不足由 hls.js ABR 自动降档。
+
+## 智能跳过片头
+
+- 开关在播放页「自动跳过片头」一行的第一项，默认开启；关闭后恢复固定秒数逻辑。
+- 兼容两种模式：固定秒数（默认 90 秒）与智能识别。智能识别未出结果前不跳（避免误切），识别成功后自动跳并提示「已自动跳过片头 mm:ss」；识别失败/超时回退固定秒数。
+- 服务端 `GET /api/intro?title=&key=&url=`：ffmpeg 下载开头最多 165 秒（带 Referer/Origin，20 秒无数据即放弃），分析黑场（`blackdetect`）、镜头切换（`scene` 阈值 0.30）和静音（`silencedetect -32dB`），以「黑场优先 + 最早合格转场」启发式给出片头结束点；命中缓存 24 小时、未识别 6 小时，串行执行避免抢带宽。
+- 识别结果按「源 key + 剧集 id」缓存在浏览器 localStorage（`libretv:intro-auto-cache:v1`，`-1` 表示该剧没有片头），同一部剧的后续集数直接秒跳。
+- 需要 ffmpeg：用 `FFMPEG_PATH` 指定，或放到 `/usr/local/bin`、`/usr/bin`、PATH 中；未安装 ffmpeg 时自动回退固定秒数。Windows 便携包内置在 `D:\LibreTV\bin\ffmpeg.exe`。
+- 实测：《武林外传》（360资源）与《庆余年》（量子资源）第 1 集均识别为 95 秒，与人工对帧的片头结束点一致。
+
+## 排行榜实时更新与评分排序
+
+- 首页「影视排行榜」默认按 **豆瓣评分从高到低** 排序（同分或无评分保持原顺序）；序号按排序后的位置显示。
+- 榜单显示「● 实时更新 · 更新于 HH:MM:SS」，前端每 60 秒轮询一次（页面在前台时），支持手动刷新（`force=1` 强制绕过缓存）。
+- 服务端 `GET /api/hot-list?id=&force=1` 返回 `{items, updatedAt}`，缓存时长由 `HOT_LIST_CACHE_TTL_MS` 控制（默认 1 小时，允许 30 秒~6 小时）；上游失败时回退到上一次成功的数据。
+
+## 截图
+
+`docs/screenshots/` 下的截图均来自本分支的实际部署：
+
+| 文件 | 内容 |
+| --- | --- |
+| `danmaku.png` | 播放页弹幕（《庆余年》真实剧集 + 弹幕） |
+| `quality-boost.png` | 「发现更清晰线路」提示条 |
+| `quality-switched.png` | 一键切换后 1080p 播放 |
+| `smart-intro.png` | 「智能识别片头」开关与说明 |
+| `ranking-live.png` | 排行榜实时更新与评分降序 |
+| `desktop-app.png` | Windows 独立应用窗口 |
 
 ## 从本分支源码运行
 
@@ -47,19 +104,26 @@
 ```sh
 npm ci
 cp .env.example .env.local
-# 编辑 .env.local，设置自己的 PASSWORD 与需要的 DEFAULT_SOURCES
+# 编辑 .env.local，设置自己的 PASSWORD 与需要的 DEFAULT_SOURCES / DEFAULT_LIVE_SOURCES
 npm run build
 npm start
 ```
 
 访问 `http://localhost:8080`。已有的本地桌面窗口连接同一服务，服务更新后刷新或重启窗口即可生效。本仓库不包含个人密码、观看记录、第三方源私有配置或本机桌面封装二进制。
 
+可选组件（不配置也能正常播放，对应功能会自动关闭或降级）：
+
+- **弹幕**：自建 danmu_api 后设置 `DANMU_API_BASE`（见上文「弹幕」）。
+- **智能片头识别**：安装 ffmpeg 或设置 `FFMPEG_PATH`（见上文「智能跳过片头」；未安装则退回固定秒数）。
+- **排行榜刷新频率**：`HOT_LIST_CACHE_TTL_MS`。
+- **Bangumi 目录**：直连不通时设置 `BANGUMI_PROXY_URL`。
+
 ## 验证
 
 ```sh
-npm test
+npm test      # 462 个用例
 npm run lint
 npm run build
 ```
 
-自动测试覆盖目录参数、分页上限、数据归一、鉴权、韩剧交集筛选、画质解析、季度集号匹配和播放导航。外部目录与第三方播放源会变化；自动测试使用 mock，不能代替当前网络下的实际页面与播放验证。
+自动测试覆盖目录参数、分页上限、数据归一、鉴权、韩剧交集筛选、画质解析、季度集号匹配、播放导航、排行榜排序（`ranking-sort.test.ts`）、画质提升判据（`quality-boost.test.ts`）和片头识别解析与评分（`intro-detect.test.ts`）。外部目录与第三方播放源会变化；自动测试使用 mock，不能代替当前网络下的实际页面与播放验证。
